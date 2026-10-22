@@ -13,7 +13,7 @@ from __future__ import annotations
 from app.trainer.heuristic import HeuristicSettings
 
 
-PROFILE_NAMES = ("normal", "high", "maximum")
+PROFILE_NAMES = ("normal", "high", "maximum", "play")
 
 # Alta: pensada para combinaciones. El desplazamiento de confirmación baja
 # de 0.40 a 0.18 anchos de hombro y el cooldown por brazo de 280 ms a 80 ms.
@@ -73,6 +73,35 @@ _MAXIMUM = HeuristicSettings(
 )
 
 
+# Juego: confirma al frenar el golpe, sin exigir volver del todo a guardia.
+_PLAY = HeuristicSettings(
+    smooth_alpha=0.85,
+    baseline_alpha=0.28,
+    start_extension=0.04,
+    commit_extension=0.08,
+    straight_gain=0.08,
+    straight_elbow=75.0,
+    hook_lateral=0.12,
+    hook_elbow_max=170.0,
+    lateral_start=0.06,
+    lateral_commit=0.10,
+    retract_hysteresis=0.03,
+    lateral_hysteresis=0.03,
+    return_margin=0.50,
+    return_lateral=0.50,
+    min_wrist_speed=0.05,
+    min_extension_rate=0.12,
+    min_cycle_ms=25,
+    max_cycle_ms=900,
+    start_timeout_ms=350,
+    cooldown_ms=35,
+    max_missing_frames=12,
+    allow_early_confirm=True,
+    confirm_on_slowdown=True,
+    profile_name="play",
+)
+
+
 def profile_settings(name: str) -> HeuristicSettings:
     """Devuelve una copia lógica del perfil. NORMAL es el comportamiento anterior."""
 
@@ -83,7 +112,9 @@ def profile_settings(name: str) -> HeuristicSettings:
         return _HIGH
     if key == "maximum":
         return _MAXIMUM
-    raise ValueError("La sensibilidad debe ser normal, high o maximum.")
+    if key == "play":
+        return _PLAY
+    raise ValueError("La sensibilidad debe ser normal, high, maximum o play.")
 
 
 def sensitivity_label(name: str) -> str:
@@ -91,6 +122,7 @@ def sensitivity_label(name: str) -> str:
         "normal": "NORMAL",
         "high": "HIGH",
         "maximum": "MAXIMUM",
+        "play": "PLAY",
         "calibrado": "CALIBRADO",
     }
     return labels.get(name, name.upper())

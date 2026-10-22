@@ -67,13 +67,14 @@ class AppConfig:
             "train",
             "live",
             "benchmark",
+            "calibrate",
             "dataset-report",
             "targets",
             "game",
         }:
             raise ValueError(
                 "El modo debe ser 'track', 'collect', 'train', 'live', 'benchmark', "
-                "'dataset-report', 'targets' o 'game'."
+                "'calibrate', 'dataset-report', 'targets' o 'game'."
             )
         if self.stance != ORTHODOX_STANCE:
             raise ValueError("Esta fase solamente admite la postura orthodox.")

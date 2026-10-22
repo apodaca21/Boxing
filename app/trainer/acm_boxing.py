@@ -15,7 +15,7 @@ hombros. No acepta el vector NEAT de 92 características.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -269,6 +269,12 @@ class SequenceRecognizer:
                 label_id=None,
                 display_name=self._last_name,
                 rejection="cooldown" if speed >= self.settings.min_punch_speed else None,
+                score_labels=PUNCH_ACTIONS,
+                diagnostics={
+                    "recovery_frames_remaining": self._recovery,
+                    "speed": speed,
+                    "min_punch_speed": self.settings.min_punch_speed,
+                },
             )
         if len(self._frames) < self.settings.sequence_length:
             return neutral_result("external")
@@ -297,7 +303,7 @@ class SequenceRecognizer:
         scores = _softmax(logits)
         choice = int(np.argmax(scores))
         if float(scores[choice]) < self.settings.confidence_threshold:
-            return self._block_or_neutral(sequence)
+            return self._block_or_neutral(sequence, punch_scores=scores)
         action = PUNCH_ACTIONS[choice]
         arm = dominant_arm(
             raw_frames,
@@ -315,26 +321,75 @@ class SequenceRecognizer:
             display_name=event.display_name,
             events=(event,),
             active_arm=event.arm,
+            score_labels=PUNCH_ACTIONS,
+            scores=tuple(float(score) for score in scores),
+            diagnostics={
+                "chosen_action": action,
+                "confidence": float(scores[choice]),
+                "confidence_threshold": self.settings.confidence_threshold,
+                "recovery_frames": self.settings.recovery_frames,
+                "arm_evidence": arm,
+            },
         )
 
-    def _block_or_neutral(self, sequence: np.ndarray) -> ClassificationResult:
+    def _block_or_neutral(
+        self,
+        sequence: np.ndarray,
+        *,
+        punch_scores: np.ndarray,
+    ) -> ClassificationResult:
         if self._predict_block is None:
-            return neutral_result("external")
+            return replace(
+                neutral_result("external"),
+                rejection="activacion insuficiente",
+                score_labels=PUNCH_ACTIONS,
+                scores=tuple(float(score) for score in punch_scores),
+                diagnostics={
+                    "max_punch_score": float(np.max(punch_scores)),
+                    "confidence_threshold": self.settings.confidence_threshold,
+                },
+            )
         try:
             logits = np.asarray(self._predict_block(sequence), dtype=np.float64).reshape(-1)
         except Exception:
-            return neutral_result("external")
+            return replace(
+                neutral_result("external"),
+                rejection="activacion insuficiente",
+                score_labels=PUNCH_ACTIONS,
+                scores=tuple(float(score) for score in punch_scores),
+            )
         if logits.shape != (len(BLOCK_ACTIONS),) or not np.all(np.isfinite(logits)):
-            return neutral_result("external")
+            return replace(
+                neutral_result("external"),
+                rejection="activacion insuficiente",
+                score_labels=PUNCH_ACTIONS,
+                scores=tuple(float(score) for score in punch_scores),
+            )
         scores = _softmax(logits)
         choice = int(np.argmax(scores))
         if float(scores[choice]) < self.settings.confidence_threshold:
-            return neutral_result("external")
+            return replace(
+                neutral_result("external"),
+                rejection="activacion insuficiente",
+                score_labels=PUNCH_ACTIONS,
+                scores=tuple(float(score) for score in punch_scores),
+                diagnostics={"block_score": float(scores[choice])},
+            )
         action = BLOCK_ACTIONS[choice]
         if action == "high_guard":
-            return neutral_result("external")
+            return replace(
+                neutral_result("external"),
+                score_labels=PUNCH_ACTIONS,
+                scores=tuple(float(score) for score in punch_scores),
+                diagnostics={"block_action": action},
+            )
         if action == "negative":
-            return neutral_result("external")
+            return replace(
+                neutral_result("external"),
+                score_labels=PUNCH_ACTIONS,
+                scores=tuple(float(score) for score in punch_scores),
+                diagnostics={"block_action": action},
+            )
         display = "Bloqueo de antebrazo" if action == "forearm_block" else "Parada"
         self._last_name = display
         self._recovery = self.settings.recovery_frames
@@ -343,4 +398,7 @@ class SequenceRecognizer:
             status=STATUS_NEUTRAL,
             label_id=None,
             display_name=display,
+            score_labels=PUNCH_ACTIONS,
+            scores=tuple(float(score) for score in punch_scores),
+            diagnostics={"block_action": action, "block_score": float(scores[choice])},
         )

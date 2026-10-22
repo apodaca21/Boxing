@@ -18,7 +18,7 @@ from app.data_collector import DataCollector
 from app.dataset_manager import DatasetError, DatasetManager
 from app.geometry import extract_biomechanical_features
 from app.overlay import render_frame
-from app.pose_tracker import PoseTracker
+from app.pose_tracker import LandmarkId, PoseTracker
 from app.trainer.factory import CLASSIFIER_NAMES
 from app.trainer.neat_classifier import ClassifierUnavailable
 from app.trainer.session import TrainingSession
@@ -87,15 +87,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("track", "collect", "train", "live", "benchmark", "dataset-report", "targets", "game"),
+        choices=("track", "collect", "train", "live", "benchmark", "calibrate", "dataset-report", "targets", "game"),
         default="track",
-        help="track, collect, train, live, benchmark, dataset-report, targets o game.",
+        help="track, collect, train, live, benchmark, calibrate, dataset-report, targets o game.",
     )
     parser.add_argument(
         "--classifier",
         choices=CLASSIFIER_NAMES,
         default="heuristic",
         help="Clasificador del modo live: heuristic, neat o external.",
+    )
+    parser.add_argument(
+        "--orientation",
+        choices=("no_especificada", "frontal", "angulo_30_45"),
+        default="no_especificada",
+        help="Orientación declarada para calibración; también puede elegirse con F/A en pantalla.",
+    )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        help="JSON o directorio de calibración revisada; solo se aplica con --classifier heuristic.",
     )
     parser.add_argument(
         "--neat-model",
@@ -171,8 +182,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sensitivity",
-        choices=("normal", "high", "maximum"),
-        help="Perfil del detector. En sparring, el predeterminado es high. En benchmark, normal.",
+        choices=("normal", "high", "maximum", "play"),
+        help="Perfil del detector. En el juego, play es el predeterminado. En sparring, high.",
     )
     parser.add_argument(
         "--repetitions",
@@ -199,6 +210,11 @@ def parse_args() -> argparse.Namespace:
         "--no-save-samples",
         action="store_true",
         help="No guarda ventanas biomecánicas aunque la persona verifique la repetición.",
+    )
+    parser.add_argument(
+        "--consent",
+        action="store_true",
+        help="Confirma explícitamente que autorizas la captura local de muestras biomecánicas.",
     )
     parser.add_argument(
         "--training-order",
@@ -279,8 +295,11 @@ def run(config: AppConfig) -> None:
         cv2.destroyAllWindows()
 
 
-def run_collection(config: AppConfig) -> None:
+def run_collection(config: AppConfig, args: argparse.Namespace | None = None) -> None:
     config.validate()
+    if args is None or not args.consent:
+        print("La recopilación está bloqueada hasta confirmar consentimiento explícito con --consent.")
+        return
     fps_meter = FrameRateMeter(config.fps_window_size)
     dataset = DatasetManager(config.data_dir)
     collector = DataCollector(config, dataset)
@@ -356,6 +375,14 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
         external_dir=args.external_model,
         sensitivity=sensitivity,
     )
+    if args.calibration is not None:
+        if classifier.name != "heuristic":
+            print("--calibration solo aplica al clasificador heurístico.")
+            return 2
+        from app.trainer.calibration_session import load_proposed_settings
+
+        classifier.apply_settings(load_proposed_settings(args.calibration.expanduser().resolve()))
+        print(f"Propuesta de calibración aplicada explícitamente: {args.calibration}")
     tune = getattr(classifier, "set_sensitivity", None)
     if tune is not None and classifier.name != "heuristic":
         tune(sensitivity)
@@ -484,6 +511,155 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     return 0
 
 
+def _benchmark_evidence(
+    config: AppConfig,
+    pose: object,
+    features: object,
+    result: object,
+    classifier: object,
+    timestamp_ms: int,
+) -> dict[str, object]:
+    """Empaqueta telemetría observable de un fotograma de benchmark."""
+
+    pose_detected = bool(getattr(pose, "detected", False))
+    required = (
+        LandmarkId.LEFT_SHOULDER,
+        LandmarkId.RIGHT_SHOULDER,
+        LandmarkId.LEFT_ELBOW,
+        LandmarkId.RIGHT_ELBOW,
+        LandmarkId.LEFT_WRIST,
+        LandmarkId.RIGHT_WRIST,
+    )
+    reliable = 0
+    for landmark_id in required:
+        landmark = getattr(pose, "landmark")(landmark_id)
+        if landmark is not None and landmark.is_reliable(
+            config.min_landmark_visibility,
+            config.min_landmark_presence,
+        ):
+            reliable += 1
+    tracking_quality = reliable / len(required) if pose_detected else 0.0
+    left_arm_reliable = 0
+    right_arm_reliable = 0
+    for landmark_id in (
+        LandmarkId.LEFT_SHOULDER,
+        LandmarkId.LEFT_ELBOW,
+        LandmarkId.LEFT_WRIST,
+    ):
+        landmark = getattr(pose, "landmark")(landmark_id)
+        if landmark is not None and landmark.is_reliable(
+            config.min_landmark_visibility,
+            config.min_landmark_presence,
+        ):
+            left_arm_reliable += 1
+    for landmark_id in (
+        LandmarkId.RIGHT_SHOULDER,
+        LandmarkId.RIGHT_ELBOW,
+        LandmarkId.RIGHT_WRIST,
+    ):
+        landmark = getattr(pose, "landmark")(landmark_id)
+        if landmark is not None and landmark.is_reliable(
+            config.min_landmark_visibility,
+            config.min_landmark_presence,
+        ):
+            right_arm_reliable += 1
+    telemetry = getattr(classifier, "telemetry", {})
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    diagnostics = getattr(result, "diagnostics", {})
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    events = getattr(result, "events", ())
+    active_arm = getattr(result, "active_arm", None)
+    if active_arm is None and events:
+        active_arm = events[0].arm
+    prefix = "" if active_arm not in {"left", "right"} else f"{active_arm}_"
+    settings = getattr(classifier, "settings", None)
+    cooldown_ms = getattr(settings, "cooldown_ms", None)
+    if not isinstance(cooldown_ms, int):
+        cooldown_ms = None
+    cooldown_until = diagnostics.get("cooldown_until_ms")
+    if cooldown_until is None:
+        cooldown_until = telemetry.get(f"{prefix}cooldown_until_ms") if prefix else None
+    remaining = None
+    if isinstance(cooldown_until, (int, float)) and cooldown_until >= timestamp_ms:
+        remaining = float(cooldown_until) - timestamp_ms
+    cooldown_arms = tuple(
+        side
+        for side in ("left", "right")
+        if isinstance(telemetry.get(f"{side}_cooldown_until_ms"), (int, float))
+        and float(telemetry[f"{side}_cooldown_until_ms"]) >= timestamp_ms
+    )
+    cooldown_remaining = max(
+        (
+            float(telemetry[f"{side}_cooldown_until_ms"]) - timestamp_ms
+            for side in cooldown_arms
+        ),
+        default=0.0,
+    )
+    rejections = tuple(
+        str(telemetry.get(f"{side}_rejection"))
+        for side in ("left", "right")
+        if telemetry.get(f"{side}_rejection")
+    )
+    left_wrist = getattr(features, "left_wrist_relative", None)
+    right_wrist = getattr(features, "right_wrist_relative", None)
+    evidence: dict[str, object] = {
+        "timestamp_ms": timestamp_ms,
+        "pose_detected": pose_detected,
+        "tracking_quality": tracking_quality,
+        "left_arm_tracking_quality": left_arm_reliable / 3 if pose_detected else 0.0,
+        "right_arm_tracking_quality": right_arm_reliable / 3 if pose_detected else 0.0,
+        # El detector heurístico puede usar el ángulo 3D solo cuando sus
+        # landmarks mundiales son fiables; ese valor es el que debe quedar en
+        # la evidencia, con el extractor 2D como fallback.
+        "left_elbow_angle": (
+            telemetry.get("left_elbow_angle")
+            if telemetry.get("left_elbow_angle") is not None
+            else getattr(features, "left_elbow_angle", None)
+        ),
+        "right_elbow_angle": (
+            telemetry.get("right_elbow_angle")
+            if telemetry.get("right_elbow_angle") is not None
+            else getattr(features, "right_elbow_angle", None)
+        ),
+        "left_wrist_x": None if left_wrist is None else left_wrist.x,
+        "left_wrist_y": None if left_wrist is None else left_wrist.y,
+        "right_wrist_x": None if right_wrist is None else right_wrist.x,
+        "right_wrist_y": None if right_wrist is None else right_wrist.y,
+        "left_speed": telemetry.get("left_speed"),
+        "right_speed": telemetry.get("right_speed"),
+        "left_extension": telemetry.get("left_extension"),
+        "right_extension": telemetry.get("right_extension"),
+        "left_lateral": telemetry.get("left_lateral"),
+        "right_lateral": telemetry.get("right_lateral"),
+        "left_phase": telemetry.get("left_phase"),
+        "right_phase": telemetry.get("right_phase"),
+        "phase": telemetry.get(f"{active_arm}_phase") if active_arm else getattr(result, "status", None),
+        "status": getattr(result, "status", None),
+        "display_name": getattr(result, "display_name", None),
+        "label_id": getattr(result, "label_id", None),
+        "active_arm": active_arm,
+        "candidate": getattr(result, "candidate", None),
+        "rejection": getattr(result, "rejection", None),
+        "latency_ms": getattr(result, "latency_ms", None),
+        "score_labels": tuple(getattr(result, "score_labels", ()) or ()),
+        "scores": tuple(getattr(result, "scores", ()) or ()),
+        "cooldown_ms": cooldown_ms,
+        "cooldown_remaining_ms": remaining if remaining is not None else cooldown_remaining,
+        "cooldown_active": bool(cooldown_arms) or remaining is not None,
+        "cooldown_arms": cooldown_arms,
+        "arm_rejections": rejections,
+        "event_start_ms": diagnostics.get("event_start_ms") or telemetry.get(f"{prefix}event_start_ms") if prefix else diagnostics.get("event_start_ms"),
+        "event_end_ms": diagnostics.get("event_end_ms") or telemetry.get(f"{prefix}event_end_ms") if prefix else diagnostics.get("event_end_ms"),
+        "event_count": len(events),
+        "classifier_diagnostics": dict(diagnostics),
+        "left_classification_reason": diagnostics.get("left_classification_reason"),
+        "right_classification_reason": diagnostics.get("right_classification_reason"),
+        "left_movement_detected": diagnostics.get("left_movement_detected"),
+        "right_movement_detected": diagnostics.get("right_movement_detected"),
+    }
+    return evidence
+
+
 def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
     from datetime import datetime
 
@@ -493,14 +669,8 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
     from app.data_collector import build_frame_record
     from app.dataset_manager import DatasetManager
     from app.trainer.factory import create_classifier
+    from app.trainer.capabilities import classifier_capabilities
 
-    if args.classifier == "neat":
-        print(
-            "La evaluación usa el detector heurístico o el modelo externo. "
-            "NEAT sigue disponible en --mode live y --mode train.",
-            file=sys.stderr,
-        )
-        return 2
     sensitivity = args.sensitivity or "normal"
     classifier = create_classifier(
         args.classifier,
@@ -509,6 +679,14 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
         external_dir=args.external_model,
         sensitivity=sensitivity,
     )
+    if args.calibration is not None:
+        if classifier.name != "heuristic":
+            print("--calibration solo aplica al clasificador heurístico.")
+            return 2
+        from app.trainer.calibration_session import load_proposed_settings
+
+        classifier.apply_settings(load_proposed_settings(args.calibration.expanduser().resolve()))
+        print(f"Propuesta de calibración aplicada explícitamente: {args.calibration}")
     tune = getattr(classifier, "set_sensitivity", None)
     if tune is not None and classifier.name != "heuristic":
         tune(sensitivity)
@@ -533,6 +711,7 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
     if not args.no_save_samples:
         store = VerifiedSampleStore(config, DatasetManager(config.data_dir))
     frames: list = []
+    counter_audit = TrainingSession()
     fps_meter = FrameRateMeter(config.fps_window_size)
     camera = Camera(
         index=config.camera_index,
@@ -541,8 +720,14 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
         probe_attempts=config.camera_probe_attempts,
     )
     print("Evaluación guiada. La consigna no se toma como un acierto.")
-    print("Y confirma la ejecución, 0-4 corrige la etiqueta, X excluye y Q termina.")
+    print("Y confirma, 0-4 corrige, R repite, X marca incorrecto/excluye y Q termina.")
     print(f"Sensibilidad {sensitivity}. Repeticiones por clase: {args.repetitions}.")
+    capabilities = classifier_capabilities(classifier.name)
+    print("Clases nativas: " + ", ".join(str(item) for item in capabilities["native_classes"]))
+    if classifier.name == "external":
+        print("El externo mantiene Jab/Cross/HOOK/Uppercut separados; no inventa lado para Jab, Cross ni Uppercut.")
+    elif classifier.name == "neat":
+        print("NEAT conserva sus cinco salidas EvoBox y registra activaciones crudas; no son probabilidades calibradas.")
 
     try:
         with PoseTracker(
@@ -563,6 +748,11 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
                 )
                 previous = protocol.phase
                 protocol.advance(packet.timestamp_ms)
+                if protocol.phase == "prepare" and previous != "prepare":
+                    reset = getattr(classifier, "reset", None)
+                    if reset is not None:
+                        reset()
+                    counter_audit.reset()
                 if protocol.phase == "execute" and previous != "execute":
                     frames = []
                 result = classifier.update(
@@ -576,11 +766,28 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
                     frames.append(
                         build_frame_record(config, packet.timestamp_ms, pose, features)
                     )
+                    before_count = counter_audit.punch_total
+                    counter_audit.advance(packet.timestamp_ms, result)
+                    counter_delta = counter_audit.punch_total - before_count
+                    evidence = _benchmark_evidence(
+                        config,
+                        pose,
+                        features,
+                        result,
+                        classifier,
+                        packet.timestamp_ms,
+                    )
+                    evidence["counter_delta"] = counter_delta
+                    evidence["counter_ignored"] = max(
+                        0,
+                        len(result.events) - counter_delta,
+                    )
                     protocol.observe(
                         packet.timestamp_ms,
                         result.events,
                         latency_ms=result.latency_ms,
                         fps=fps,
+                        evidence=evidence,
                     )
                 display = render_frame(
                     packet.frame,
@@ -613,8 +820,11 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
                     frames = []
                 elif protocol.phase == "review" and ord("0") <= key <= ord("4"):
                     protocol.correct(key - ord("0"))
+                elif protocol.phase == "review" and key in (ord("r"), ord("R")):
+                    protocol.repeat(packet.timestamp_ms)
+                    frames = []
                 elif protocol.phase == "review" and key in (ord("x"), ord("X")):
-                    protocol.exclude()
+                    protocol.exclude("ejecución incorrecta o inválida según el usuario")
                     frames = []
                 if protocol.finished:
                     break
@@ -644,6 +854,214 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
     if comparison is not None:
         print(f"Comparación de perfiles en {comparison}")
         print("Ningún perfil se marca como ganador por haber contado más golpes.")
+    return 0
+
+
+def _draw_calibration_overlay(
+    image: object,
+    view: object,
+    snapshot: dict[str, object],
+    orientation: str,
+) -> None:
+    """HUD de calibración/preflight: muestra evidencia, no una etiqueta automática."""
+
+    if not hasattr(image, "shape"):
+        return
+    height, width = image.shape[:2]
+    panel_height = min(215, height)
+    panel_top = height - panel_height
+    roi = image[panel_top:, :]
+    dark = roi.copy()
+    dark[:, :] = (17, 20, 27)
+    import cv2
+
+    cv2.addWeighted(dark, 0.86, roi, 0.14, 0.0, dst=roi)
+    review = bool(getattr(view, "review", False))
+    accent = (40, 180, 255) if review else (80, 220, 120)
+    cv2.rectangle(image, (0, panel_top), (width - 1, height - 1), accent, 1)
+    ascii_text = lambda value: str(value).translate(str.maketrans("áéíóúÁÉÍÓÚñÑüÜ", "aeiouAEIOUnNuU"))
+    instruction = ascii_text(getattr(view, "instruction", "Calibracion"))
+    detail = ascii_text(getattr(view, "detail", ""))
+    progress = ascii_text(getattr(view, "progress", ""))
+    cv2.putText(image, instruction, (18, panel_top + 30), cv2.FONT_HERSHEY_DUPLEX, 0.64, (245, 247, 250), 1, cv2.LINE_AA)
+    cv2.putText(image, progress, (18, panel_top + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.46, accent, 1, cv2.LINE_AA)
+    cv2.putText(image, detail[: max(36, (width - 36) // 8)], (18, panel_top + 78), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (222, 226, 232), 1, cv2.LINE_AA)
+
+    body = "CUERPO OK" if snapshot.get("body_visible") else "ADVERTENCIA: hombros/caderas no visibles"
+    body_color = (80, 220, 120) if snapshot.get("body_visible") else (70, 175, 255)
+    cv2.putText(image, ascii_text(body), (18, panel_top + 103), cv2.FONT_HERSHEY_SIMPLEX, 0.43, body_color, 1, cv2.LINE_AA)
+    fps = snapshot.get("fps")
+    fps_text = "--" if not isinstance(fps, (int, float)) else f"{float(fps):.1f}"
+    cv2.putText(
+        image,
+        f"Orientacion {ascii_text(orientation)}  FPS {fps_text}  torso {float(snapshot.get('torso_tracking_quality', 0.0)):.2f}",
+        (18, panel_top + 125),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.41,
+        (222, 226, 232),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        f"Brazo anatomico izq {float(snapshot.get('left_arm_tracking_quality', 0.0)):.2f}  der {float(snapshot.get('right_arm_tracking_quality', 0.0)):.2f}",
+        (18, panel_top + 147),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.41,
+        (222, 226, 232),
+        1,
+        cv2.LINE_AA,
+    )
+    left_angle = snapshot.get("left_elbow_angle")
+    right_angle = snapshot.get("right_elbow_angle")
+    left_text = "--" if left_angle is None else f"{float(left_angle):.1f}"
+    right_text = "--" if right_angle is None else f"{float(right_angle):.1f}"
+    cv2.putText(
+        image,
+        f"Codo izq {left_text} deg  codo der {right_text} deg  landmarks {float(snapshot.get('required_landmarks_quality', 0.0)):.2f}",
+        (18, panel_top + 169),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.41,
+        (222, 226, 232),
+        1,
+        cv2.LINE_AA,
+    )
+    controls = "F frontal  A 30-45 grados  ENTER inicia | Y confirma 0-4 corrige R repite X excluye Q sale"
+    cv2.putText(image, controls, (18, height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (170, 177, 188), 1, cv2.LINE_AA)
+
+
+def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
+    """Calibración individual real; guarda una propuesta, no la aplica."""
+
+    from app.trainer.calibration_session import CalibrationProtocol, save_calibration
+    from app.trainer.factory import create_classifier
+    from app.trainer.preflight import orientation_label, tracking_snapshot
+
+    if args.classifier != "heuristic":
+        print("La calibración individual actual aplica únicamente al clasificador heurístico.")
+        return 2
+    config.validate()
+    sensitivity = args.sensitivity or "normal"
+    classifier = create_classifier("heuristic", sensitivity=sensitivity)
+    original_settings = classifier.settings
+    protocol = CalibrationProtocol(
+        prepare_ms=args.prepare_ms,
+        return_ms=args.return_ms,
+        next_ms=args.next_ms,
+    )
+    orientation = orientation_label(args.orientation)
+    preflight_rows: list[dict[str, object]] = []
+    fps_meter = FrameRateMeter(config.fps_window_size)
+    camera = Camera(
+        index=config.camera_index,
+        width=config.frame_width,
+        height=config.frame_height,
+        probe_attempts=config.camera_probe_attempts,
+    )
+    print("Calibración individual real del detector heurístico.")
+    print("No modifica el clasificador ni crea muestras NEAT.")
+    print("En preflight: F = frontal, A = 30–45°, ENTER inicia, Q sale.")
+    print("En revisión: Y/ENTER confirma, 0–4 corrige, R repite, X excluye.")
+
+    try:
+        with PoseTracker(
+            model_path=config.model_path,
+            min_detection_confidence=config.min_pose_detection_confidence,
+            min_presence_confidence=config.min_pose_presence_confidence,
+            min_tracking_confidence=config.min_tracking_confidence,
+        ) as tracker, camera:
+            cv2.namedWindow(LIVE_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+            while True:
+                packet = camera.read()
+                pose = tracker.detect(packet.frame, packet.timestamp_ms)
+                features = extract_biomechanical_features(
+                    pose,
+                    min_visibility=config.min_landmark_visibility,
+                    min_presence=config.min_landmark_presence,
+                    image_size=(packet.width, packet.height),
+                )
+                fps = fps_meter.tick()
+                snapshot = tracking_snapshot(
+                    pose,
+                    config,
+                    fps=fps,
+                    orientation=orientation,
+                    left_elbow_angle=features.left_elbow_angle,
+                    right_elbow_angle=features.right_elbow_angle,
+                )
+                preflight_rows.append(snapshot)
+                previous = protocol.phase
+                protocol.advance(packet.timestamp_ms)
+                if protocol.phase == "prepare" and previous != "prepare":
+                    classifier.reset()
+                result = classifier.update(
+                    features,
+                    pose_detected=pose.detected,
+                    pose=pose,
+                    frame=packet.frame,
+                )
+                if protocol.phase == "execute":
+                    evidence = _benchmark_evidence(
+                        config,
+                        pose,
+                        features,
+                        result,
+                        classifier,
+                        packet.timestamp_ms,
+                    )
+                    evidence.update(snapshot)
+                    protocol.observe(packet.timestamp_ms, evidence, events=result.events)
+                display = render_frame(packet.frame, pose, features, fps, config)
+                _draw_calibration_overlay(display, protocol.view(), snapshot, orientation)
+                cv2.imshow(LIVE_WINDOW_TITLE, display)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q"), 27):
+                    break
+                if protocol.phase == "preflight":
+                    if key in (ord("f"), ord("F")):
+                        orientation = "frontal"
+                    elif key in (ord("a"), ord("A")):
+                        orientation = "angulo_30_45"
+                    elif key in (13, 10, ord(" ")):
+                        protocol.start(packet.timestamp_ms)
+                        classifier.reset()
+                elif protocol.phase == "review":
+                    if key in (ord("y"), ord("Y"), ord(" "), 13, 10):
+                        protocol.confirm()
+                    elif ord("0") <= key <= ord("4"):
+                        protocol.correct(key - ord("0"))
+                    elif key in (ord("r"), ord("R")):
+                        protocol.repeat(packet.timestamp_ms)
+                    elif key in (ord("x"), ord("X")):
+                        protocol.exclude()
+                if protocol.finished:
+                    break
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+
+    if not protocol.records:
+        print("Calibración cancelada antes de iniciar; no se guardó una sesión.")
+        return 0
+    directory = save_calibration(
+        args.results_dir,
+        orientation=orientation,
+        preflight_rows=preflight_rows,
+        records=protocol.records,
+        current=original_settings,
+    )
+    import json
+
+    payload = json.loads((directory / "calibration.json").read_text(encoding="utf-8"))
+    analysis = payload["analysis"]
+    print(f"Calibración guardada en {directory}")
+    print("Parámetros actuales respaldados en params.json; propuesta no aplicada automáticamente.")
+    print(
+        "Intentos válidos para propuesta: "
+        f"{analysis.get('valid_punch_attempts', 0)}; "
+        f"separación velocidad: {analysis.get('speed_noise_p95')} → {analysis.get('punch_speed_p10')}"
+    )
+    print("Para evaluar después usa explícitamente los parámetros revisados; esta sesión no demuestra mejora real todavía.")
     return 0
 
 
@@ -981,6 +1399,8 @@ def main() -> int:
             return run_live(config, args)
         if config.mode == "benchmark":
             return run_benchmark(config, args)
+        if config.mode == "calibrate":
+            return run_calibrate(config, args)
         if config.mode == "targets":
             return run_targets(config, args)
         if config.mode == "game":
@@ -988,7 +1408,7 @@ def main() -> int:
 
             return run_game(config, args)
         if config.mode == "collect":
-            run_collection(config)
+            run_collection(config, args)
         else:
             run(config)
     except KeyboardInterrupt:

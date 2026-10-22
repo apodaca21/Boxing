@@ -87,6 +87,7 @@ class TargetChallenge:
         self._attempt_ms = 0
         self._mark_ms: int | None = None
         self._consumed: str | None = None
+        self._consumed_ids: set[str] = set()
         self._flash_until = -1
 
     def handle_key(self, key: int) -> bool:
@@ -122,6 +123,7 @@ class TargetChallenge:
         event_key: str | None,
         wrist: tuple[float, float] | None,
         uncertain: bool,
+        event_id: str | None = None,
     ) -> None:
         if self.phase in {"idle", "summary"}:
             return
@@ -148,8 +150,9 @@ class TargetChallenge:
         if not tracking:
             self.message = "Sin seguimiento"
             return
-        if not event_present:
-            self._consumed = None
+        consume_key = event_id or event_key
+        if event_id and event_id in self._consumed_ids:
+            event_present = False
         self._attempt_ms += delta
         if uncertain and not event_present:
             self.message = "MOVIMIENTO NO CONFIRMADO"
@@ -160,7 +163,7 @@ class TargetChallenge:
             requested=label,
             event_present=event_present,
             event_label=event_label,
-            event_key=event_key,
+            event_key=consume_key,
             consumed_key=self._consumed,
             wrist=wrist,
             target=offset_for(label),
@@ -169,8 +172,12 @@ class TargetChallenge:
             elapsed_ms=self._attempt_ms,
             limit_ms=self.limit_ms,
         )
-        if event_present and event_key is not None:
-            self._consumed = event_key
+        if event_present and consume_key is not None:
+            self._consumed = consume_key
+            if event_id:
+                self._consumed_ids.add(event_id)
+            elif event_key:
+                self._consumed_ids.add(event_key)
         if judgement.status == "acierto":
             self._hit(now_ms)
         elif judgement.status == "equivocado":

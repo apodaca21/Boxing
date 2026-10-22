@@ -21,10 +21,32 @@ def _clock(ms: int) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-def _panel(image: NDArray[np.uint8], width: int) -> None:
+def _panel(image: NDArray[np.uint8], width: int, height: int) -> None:
     overlay = image.copy()
-    cv2.rectangle(overlay, (0, 0), (width, image.shape[0]), (12, 16, 22), -1)
+    cv2.rectangle(overlay, (0, 0), (width, height), (12, 16, 22), -1)
     cv2.addWeighted(overlay, 0.72, image, 0.28, 0, image)
+
+
+def _write_lines(
+    image: NDArray[np.uint8],
+    lines: list[str],
+    *,
+    x: int = 16,
+    y: int = 28,
+    step: int = 26,
+    scale: float = 0.52,
+) -> None:
+    for index, line in enumerate(lines):
+        cv2.putText(
+            image,
+            line[:36],
+            (x, y + index * step),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (245, 248, 252),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def draw_free(
@@ -34,44 +56,31 @@ def draw_free(
     fps: float | None,
     tracking: bool,
 ) -> None:
-    _panel(image, 300)
     lines = [
-        "EVOBOX AI",
-        "MODO LIBRE",
+        "EVOBOX AI  |  MODO LIBRE",
         f"TIEMPO {_clock(view.remaining_ms if view.phase == 'active' else view.elapsed_ms)}",
-        f"JAB {view.counts[1]}",
-        f"CROSS {view.counts[2]}",
-        f"GANCHO IZQUIERDO {view.counts[3]}",
-        f"GANCHO DERECHO {view.counts[4]}",
-        f"TOTAL {view.total} GOLPES",
-        f"ULTIMO {_plain(view.last_punch)}",
+        *[f"{_plain(name).upper()}  {count}" for name, count, _side in view.rows],
+        f"TOTAL {view.total}   ULTIMO {_plain(view.last_punch)}",
         f"COMBO {_plain(view.combo)}",
-        f"CLASIFICADOR {view.classifier.upper()}",
-        "SEGUIMIENTO OK" if tracking else "SIN SEGUIMIENTO",
-        _plain(view.message),
+        f"{view.classifier.upper()}  |  {'SEGUIMIENTO OK' if tracking else 'SIN SEGUIMIENTO'}",
         f"FPS {0 if fps is None else round(fps)}",
     ]
-    if view.phase == "summary":
+    if view.phase == "idle":
+        lines.append("ESPACIO PARA INICIAR")
+    elif view.phase == "countdown":
+        lines.append(_plain(view.message))
+    elif view.phase == "active":
+        lines.append(_plain(view.message))
+    elif view.phase == "summary":
         pace = "—" if view.punches_per_minute is None else f"{view.punches_per_minute:.0f}"
         lines.extend(
             [
-                f"RITMO {pace} / MIN",
-                f"COMBO LARGO {view.longest_combo}",
-                f"INCIERTOS {view.uncertain}",
-                "R repite   Q sale",
+                f"RITMO {pace}/MIN  COMBO LARGO {view.longest_combo}",
+                f"INCIERTOS {view.uncertain}   R repite   Q sale",
             ]
         )
-    for index, line in enumerate(lines):
-        cv2.putText(
-            image,
-            line[:34],
-            (16, 36 + index * 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (245, 248, 252),
-            1,
-            cv2.LINE_AA,
-        )
+    _panel(image, 340, 28 + len(lines) * 26)
+    _write_lines(image, lines)
     if view.phase == "active" and view.elapsed_ms + view.remaining_ms > 0:
         span = view.elapsed_ms + view.remaining_ms
         width = int(image.shape[1] * view.remaining_ms / span)
@@ -102,44 +111,26 @@ def draw_challenge(
             2,
             cv2.LINE_AA,
         )
-    _panel(image, 280)
     lines = [
-        "EVOBOX AI",
-        "BOXING TARGET CHALLENGE",
-        f"PUNTOS {view.score}",
-        f"ACIERTOS {view.hits}",
-        f"FALLOS {view.misses}",
-        f"COMBO {view.combo}",
-        f"MEJOR {view.best_combo}",
-        f"TIEMPO {_clock(view.remaining_ms)}",
-        f"NIVEL {view.difficulty.upper()}",
-        f"CLASIFICADOR {view.classifier.upper()}",
-        "SEGUIMIENTO OK" if tracking else "SIN SEGUIMIENTO",
-        _plain(view.message),
+        "EVOBOX AI  |  OBJETIVOS",
+        f"PUNTOS {view.score}   ACIERTOS {view.hits}   FALLOS {view.misses}",
+        f"COMBO {view.combo}   MEJOR {view.best_combo}",
+        f"TIEMPO {_clock(view.remaining_ms)}   {view.difficulty.upper()}",
+        f"{view.classifier.upper()}  |  {'SEGUIMIENTO OK' if tracking else 'SIN SEGUIMIENTO'}",
         f"FPS {0 if fps is None else round(fps)}",
     ]
     if view.phase == "idle":
-        lines.insert(2, "ESPACIO PARA INICIAR")
+        lines.append("ESPACIO PARA INICIAR")
+    else:
+        lines.append(_plain(view.message))
     if view.phase == "summary":
         lines.append("La puntuacion no es precision NEAT")
         lines.append("R repite   Q sale")
-    for index, line in enumerate(lines):
-        cv2.putText(
-            image,
-            line[:36],
-            (14, 32 + index * 26),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (245, 248, 252),
-            1,
-            cv2.LINE_AA,
-        )
+    _panel(image, 360, 28 + len(lines) * 26)
+    _write_lines(image, lines)
 
 
 def draw_menu(image: NDArray[np.uint8], stats: tuple[str, ...]) -> None:
-    shade = image.copy()
-    cv2.rectangle(shade, (0, 0), (image.shape[1], image.shape[0]), (8, 10, 16), -1)
-    cv2.addWeighted(shade, 0.55, image, 0.45, 0, image)
     lines = [
         "EVOBOX AI",
         "1  BOXEO LIBRE",
@@ -147,19 +138,10 @@ def draw_menu(image: NDArray[np.uint8], stats: tuple[str, ...]) -> None:
         "3  ENTRENAMIENTO / CAPTURA",
         "4  ESTADISTICAS",
         "Q  SALIR",
-        *stats,
+        *(_plain(item)[:36] for item in stats),
     ]
-    for index, line in enumerate(lines):
-        cv2.putText(
-            image,
-            _plain(line)[:48],
-            (48, 70 + index * 36),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (245, 248, 252),
-            2,
-            cv2.LINE_AA,
-        )
+    _panel(image, 250, 20 + len(lines) * 20)
+    _write_lines(image, lines, x=12, y=22, step=20, scale=0.42)
 
 
 def target_screen(

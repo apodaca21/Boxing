@@ -13,6 +13,7 @@ from app.game.free_round import FreeRound
 from app.game.store import save_round
 from app.geometry import BiomechanicalFeatures, RelativePoint
 from app.targets.placement import display_point, offset_for, project_target, radius_for
+from app.trainer.acm_boxing import punch_event
 from app.trainer.neat_classifier import NeatClassifier
 from app.trainer.results import ClassificationResult, PunchEvent
 from app.evolution.model_store import load_model
@@ -45,6 +46,18 @@ def _uncertain() -> ClassificationResult:
         status="incierto",
         label_id=None,
         display_name="MOVIMIENTO NO CONFIRMADO",
+    )
+
+
+def _external_punch(action: str, arm: str | None) -> ClassificationResult:
+    event = punch_event(action, arm)
+    return ClassificationResult(
+        source="external",
+        status="completado",
+        label_id=event.label_id,
+        display_name=event.display_name,
+        events=(event,),
+        active_arm=event.arm,
     )
 
 
@@ -90,6 +103,18 @@ class FreeRoundTests(unittest.TestCase):
         game.tick(4400, _punch(4, "Gancho derecho", "right"))
         self.assertEqual(game.snapshot().counts[3], 1)
         self.assertEqual(game.snapshot().counts[4], 1)
+
+    def test_external_types_count_once_and_stay_separate(self) -> None:
+        game = FreeRound("external", duration_ms=90_000, countdown_ms=1000)
+        _start(game)
+        game.tick(4000, _external_punch("jab", "left"))
+        game.tick(4300, _external_punch("cross", "left"))
+        game.tick(4600, _external_punch("hook", None))
+        game.tick(4900, _external_punch("uppercut", "left"))
+        view = game.snapshot()
+        self.assertEqual(view.total, 4)
+        self.assertEqual(view.named_counts, {"jab": 1, "cross": 1, "hook": 1, "uppercut": 1})
+        self.assertEqual(dict((name, count) for name, count, _side in view.rows)["Uppercut"], 1)
 
     def test_guard_and_uncertain_do_not_score(self) -> None:
         game = FreeRound("neat", duration_ms=90_000, countdown_ms=1000)

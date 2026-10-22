@@ -36,7 +36,13 @@ from app.trainer.results import (
 
 @dataclass(frozen=True, slots=True)
 class HeuristicSettings:
-    """Parámetros iniciales. No representan una calibración validada."""
+    """Parámetros iniciales. No representan una calibración validada.
+
+    ``straight_elbow_gain`` y ``hook_elbow_gain_max`` son restricciones
+    temporales, no umbrales de una postura aislada: un recto debe abrir el
+    codo respecto a su propia guardia y un gancho debe conservarlo flexionado.
+    Esto evita convertir cualquier desplazamiento lateral en gancho.
+    """
 
     smooth_alpha: float = 0.5
     baseline_alpha: float = 0.15
@@ -44,8 +50,10 @@ class HeuristicSettings:
     commit_extension: float = 0.30
     straight_gain: float = 0.40
     straight_elbow: float = 110.0
+    straight_elbow_gain: float = 25.0
     hook_lateral: float = 0.48
     hook_elbow_max: float = 145.0
+    hook_elbow_gain_max: float = 20.0
     lateral_start: float = 0.22
     lateral_commit: float = 0.36
     retract_hysteresis: float = 0.14
@@ -60,6 +68,7 @@ class HeuristicSettings:
     cooldown_ms: int = 280
     max_missing_frames: int = 6
     allow_early_confirm: bool = False
+    confirm_on_slowdown: bool = False
     profile_name: str = "normal"
 
 
@@ -82,6 +91,14 @@ class _ArmDecision:
     extension: float | None = None
     speed: float = 0.0
     lateral: float = 0.0
+    event_start_ms: int | None = None
+    event_end_ms: int | None = None
+    cooldown_until_ms: int | None = None
+    classification_reason: str | None = None
+    elbow: float | None = None
+    peak_extension: float = 0.0
+    peak_lateral: float = 0.0
+    event_id: str | None = None
 
 
 class _ArmTracker:
@@ -98,7 +115,9 @@ class _ArmTracker:
         self.frozen_extension = 0.0
         self.frozen_x = 0.0
         self.peak_extension = 0.0
+        self.initial_elbow: float | None = None
         self.peak_elbow = 0.0
+        self.peak_elbow_gain = 0.0
         self.peak_lateral = 0.0
         self.started_ms: int | None = None
         self.cooldown_until_ms = -1
@@ -110,8 +129,12 @@ class _ArmTracker:
         self.previous_y: float | None = None
         self.previous_z: float | None = None
         self.last_speed = 0.0
+        self.peak_speed = 0.0
         self.last_lateral = 0.0
         self.last_rejection: str | None = None
+        self.last_classification_reason: str | None = None
+        self.event_id: str | None = None
+        self.emitted = False
 
     def reset(self) -> None:
         self.__init__(self.side, self.settings)
@@ -122,6 +145,7 @@ class _ArmTracker:
             if self.missing_frames > self.settings.max_missing_frames:
                 unknown = self.phase != STATUS_NEUTRAL
                 self.last_rejection = "seguimiento perdido" if unknown else None
+                self.last_classification_reason = "seguimiento perdido" if unknown else None
                 self._return_to_guard(timestamp_ms, cooldown=False)
                 return self._pack(
                     STATUS_NEUTRAL,
@@ -164,24 +188,43 @@ class _ArmTracker:
                 return self._pack(STATUS_NEUTRAL, rejection="cooldown")
             if started:
                 self.last_rejection = None
+                self.last_classification_reason = None
                 self.phase = STATUS_STARTING
                 self.started_ms = timestamp_ms
+                self.event_id = f"{self.side}:{timestamp_ms}"
+                self.emitted = False
                 self.frozen_extension = self.baseline_extension
                 self.frozen_x = self.baseline_x
                 self.peak_extension = self.smooth_extension
+                self.initial_elbow = self.smooth_elbow
                 self.peak_elbow = self.smooth_elbow
+                self.peak_elbow_gain = 0.0
                 self.peak_lateral = abs(self.smooth_x - self.frozen_x)
+                self.peak_speed = speed
             elif self._near_guard(extension_gain, lateral):
                 self._update_baseline()
             return self._pack(self.phase)
 
+        previous_peak_extension = self.peak_extension
+        previous_peak_lateral = self.peak_lateral
         self.peak_extension = max(self.peak_extension, self.smooth_extension)
         self.peak_elbow = max(self.peak_elbow, self.smooth_elbow)
+        if self.initial_elbow is not None:
+            self.peak_elbow_gain = max(
+                self.peak_elbow_gain,
+                self.smooth_elbow - self.initial_elbow,
+            )
         self.peak_lateral = max(self.peak_lateral, abs(self.smooth_x - self.frozen_x))
+        self.peak_speed = max(self.peak_speed, speed)
+        still_growing = (
+            self.peak_extension > previous_peak_extension + 1e-4
+            or self.peak_lateral > previous_peak_lateral + 1e-4
+        )
         elapsed = 0 if self.started_ms is None else timestamp_ms - self.started_ms
         if elapsed > self.settings.max_cycle_ms:
             self.last_rejection = "ciclo excedido"
-            self._return_to_guard(timestamp_ms)
+            self.last_classification_reason = "ciclo excedido"
+            self._return_to_guard(timestamp_ms, cooldown=False)
             return self._pack(STATUS_NEUTRAL, unknown=True, rejection="ciclo excedido")
 
         if self.phase == STATUS_STARTING:
@@ -191,11 +234,9 @@ class _ArmTracker:
             )
             if committed:
                 self.phase = STATUS_EXTENDING
-            elif elapsed > self.settings.start_timeout_ms or (
-                extension_gain < self.settings.start_extension
-                and lateral < self.settings.lateral_start
-            ):
+            elif elapsed > self.settings.start_timeout_ms:
                 self.last_rejection = "sin compromiso"
+                self.last_classification_reason = "activacion insuficiente"
                 self._return_to_guard(timestamp_ms, cooldown=False)
             return self._pack(self.phase, rejection=self.last_rejection)
 
@@ -207,16 +248,22 @@ class _ArmTracker:
                 <= self.peak_lateral - self.settings.lateral_hysteresis
             )
         )
-        if (
-            self.settings.allow_early_confirm
-            and retracting
-            and elapsed >= self.settings.min_cycle_ms
-        ):
-            event = self._classify()
-            if event is not None:
-                self._snap_baseline()
-                self._return_to_guard(timestamp_ms)
-                return self._pack(STATUS_COMPLETED, event=event)
+        committed = (
+            self.peak_extension >= self.frozen_extension + self.settings.commit_extension
+            or self.peak_lateral >= self.settings.lateral_commit
+        )
+        had_motion = self.peak_speed >= self.settings.min_wrist_speed
+        slowing = had_motion and speed <= max(0.05, self.settings.min_wrist_speed * 0.85)
+        ready_to_close = (
+            elapsed >= self.settings.min_cycle_ms
+            and committed
+            and (retracting or (self.settings.confirm_on_slowdown and slowing))
+            and not still_growing
+        )
+        if self.settings.allow_early_confirm and ready_to_close:
+            completed = self._complete_cycle(timestamp_ms)
+            if completed is not None:
+                return completed
 
         if self.phase == STATUS_EXTENDING:
             if retracting:
@@ -230,17 +277,16 @@ class _ArmTracker:
             and abs(self.smooth_x - self.frozen_x)
             <= max(self.settings.return_lateral, 0.45 * self.peak_lateral)
         )
-        if returned and elapsed >= self.settings.min_cycle_ms:
-            event = self._classify()
-            self._return_to_guard(timestamp_ms)
-            if event is None:
-                self.last_rejection = "tipo no distinguible"
-                return self._pack(
-                    STATUS_NEUTRAL,
-                    unknown=True,
-                    rejection="tipo no distinguible",
-                )
-            return self._pack(STATUS_COMPLETED, event=event)
+        if returned and elapsed >= self.settings.min_cycle_ms and not still_growing:
+            completed = self._complete_cycle(timestamp_ms)
+            if completed is not None:
+                return completed
+            self.last_rejection = "tipo no distinguible"
+            return self._pack(
+                STATUS_NEUTRAL,
+                unknown=True,
+                rejection="tipo no distinguible",
+            )
         return self._pack(self.phase)
 
     def _smooth(self, observation: _ArmObservation) -> None:
@@ -313,6 +359,27 @@ class _ArmTracker:
         self.baseline_extension = self.smooth_extension
         self.baseline_x = self.smooth_x
 
+    def _complete_cycle(self, timestamp_ms: int) -> _ArmDecision | None:
+        """Cierra el ciclo una sola vez, con la clase de toda la trayectoria."""
+
+        if self.emitted:
+            return self._pack(STATUS_RETURNING)
+        event = self._classify()
+        if event is None:
+            self._return_to_guard(timestamp_ms, cooldown=False)
+            return None
+        event = replace(event, ended_ms=timestamp_ms)
+        self.emitted = True
+        event_start_ms = self.started_ms
+        self._snap_baseline()
+        self._return_to_guard(timestamp_ms, cooldown=True)
+        return self._pack(
+            STATUS_COMPLETED,
+            event=event,
+            event_start_ms=event_start_ms,
+            event_end_ms=timestamp_ms,
+        )
+
     def _pack(
         self,
         phase: str,
@@ -321,6 +388,8 @@ class _ArmTracker:
         unknown: bool = False,
         tracking: bool = True,
         rejection: str | None = None,
+        event_start_ms: int | None = None,
+        event_end_ms: int | None = None,
     ) -> _ArmDecision:
         candidate = None
         if event is None and phase not in (STATUS_NEUTRAL, STATUS_COMPLETED):
@@ -336,32 +405,92 @@ class _ArmTracker:
             extension=self.smooth_extension,
             speed=self.last_speed,
             lateral=self.last_lateral,
+            event_start_ms=event_start_ms,
+            event_end_ms=event_end_ms,
+            cooldown_until_ms=self.cooldown_until_ms,
+            classification_reason=self.last_classification_reason,
+            elbow=self.smooth_elbow,
+            peak_extension=self.peak_extension,
+            peak_lateral=self.peak_lateral,
+            event_id=self.event_id,
         )
 
     def _return_to_guard(self, timestamp_ms: int, *, cooldown: bool = True) -> None:
         self.phase = STATUS_NEUTRAL
         self.started_ms = None
+        self.event_id = None
+        self.emitted = False
+        self.initial_elbow = None
+        self.peak_extension = 0.0
+        self.peak_elbow = 0.0
+        self.peak_elbow_gain = 0.0
         self.peak_lateral = 0.0
+        self.peak_speed = 0.0
         if cooldown:
             self.cooldown_until_ms = timestamp_ms + self.settings.cooldown_ms
 
     def _classify(self) -> PunchEvent | None:
         extension_gain = self.peak_extension - self.frozen_extension
+        elbow_gain = self.peak_elbow_gain
         wide = self.peak_lateral >= self.settings.hook_lateral
+        self.last_classification_reason = None
+
+        # La evidencia de recto tiene prioridad sobre la anchura aparente. En
+        # una cámara frontal el movimiento hacia profundidad puede proyectarse
+        # lateralmente; la apertura progresiva del codo y la extensión radial
+        # son la evidencia más estable disponible para un recto.
         straight = (
-            not wide
-            and extension_gain >= self.settings.straight_gain
-            and self.peak_elbow >= self.settings.straight_elbow
+            extension_gain >= self.settings.straight_gain
+            and (
+                self.peak_elbow >= self.settings.straight_elbow
+                or elbow_gain >= self.settings.straight_elbow_gain
+            )
         )
-        hook = wide and self.peak_elbow <= self.settings.hook_elbow_max
+        hook = (
+            wide
+            and self.peak_elbow <= self.settings.hook_elbow_max
+            and elbow_gain <= self.settings.hook_elbow_gain_max
+        )
+        if straight and hook:
+            # Un gancho real acumula anchura; no lo conviertas en jab porque
+            # el codo también se abrió durante el mismo ciclo.
+            if self.peak_lateral >= max(extension_gain, self.settings.hook_lateral):
+                straight = False
+            else:
+                hook = False
         if straight:
+            self.last_classification_reason = (
+                "recto: extension y apertura progresiva del codo"
+            )
             label_id = 1 if self.side == "left" else 2
         elif hook:
+            self.last_classification_reason = (
+                "gancho: trayectoria lateral con codo flexionado"
+            )
             label_id = 3 if self.side == "left" else 4
+        elif self.settings.confirm_on_slowdown and (
+            extension_gain >= self.settings.start_extension
+            or self.peak_lateral >= self.settings.lateral_start
+        ):
+            if self.peak_lateral >= max(extension_gain, self.settings.lateral_start):
+                self.last_classification_reason = "candidato lateral sin evidencia completa"
+                label_id = 3 if self.side == "left" else 4
+            else:
+                self.last_classification_reason = "candidato frontal sin evidencia completa"
+                label_id = 1 if self.side == "left" else 2
         else:
+            self.last_classification_reason = "geometria ambigua o insuficiente"
             return None
         movement = MOVEMENTS[label_id]
-        return PunchEvent(movement.label_id, movement.display_name, self.side)
+        return PunchEvent(
+            movement.label_id,
+            movement.display_name,
+            self.side,
+            event_id=self.event_id,
+            started_ms=self.started_ms,
+            confirmed=True,
+            source="heuristic",
+        )
 
 
 def _blend(previous: float | None, value: float, alpha: float) -> float:
@@ -395,10 +524,35 @@ def _observation_from_pose(
     pose: PoseObservation,
     side: str,
 ) -> _ArmObservation | None:
-    """Extensión 3D. Un jab hacia la cámara casi no crece en la imagen plana."""
+    """Extrae geometría sin rellenar landmarks ni profundidad.
 
-    source = pose.world_landmarks if len(pose.world_landmarks) > int(LandmarkId.RIGHT_WRIST) else pose.landmarks
-    if len(source) <= int(LandmarkId.RIGHT_WRIST):
+    MediaPipe entrega coordenadas de imagen y coordenadas mundiales. Las
+    mundiales solo se usan cuando hombros, codo y muñeca del brazo están
+    presentes y superan los niveles de visibilidad/presencia usados por el
+    propio extractor 2D. Si no, se conserva la geometría 2D y se descarta z;
+    una z de baja calidad no debe fabricar un recto hacia cámara.
+    """
+
+    side_elbow = (
+        LandmarkId.LEFT_ELBOW if side == "left" else LandmarkId.RIGHT_ELBOW
+    )
+    side_wrist = (
+        LandmarkId.LEFT_WRIST if side == "left" else LandmarkId.RIGHT_WRIST
+    )
+    required = (
+        LandmarkId.LEFT_SHOULDER,
+        LandmarkId.RIGHT_SHOULDER,
+        side_elbow,
+        side_wrist,
+    )
+    source: tuple[LandmarkObservation, ...] | None = None
+    use_world = False
+    if _source_is_reliable(pose.world_landmarks, required):
+        source = pose.world_landmarks
+        use_world = True
+    elif _source_is_reliable(pose.landmarks, required):
+        source = pose.landmarks
+    if source is None:
         return None
     left_shoulder = source[int(LandmarkId.LEFT_SHOULDER)]
     right_shoulder = source[int(LandmarkId.RIGHT_SHOULDER)]
@@ -413,15 +567,15 @@ def _observation_from_pose(
     if not all(_finite_point(point) for point in (left_shoulder, right_shoulder, shoulder, elbow, wrist)):
         return None
 
-    local = _torso_coordinates(pose, source, wrist)
+    local = _torso_coordinates(pose, source, wrist, use_depth=use_world)
     if local is None:
         return None
     local_x, local_y, local_z, scale = local
-    angle = _angle3(shoulder, elbow, wrist)
+    angle = _angle3(shoulder, elbow, wrist) if use_world else _angle2(shoulder, elbow, wrist)
     if angle is None:
         return None
     return _ArmObservation(
-        extension=_distance3(shoulder, wrist) / scale,
+        extension=_distance(shoulder, wrist, use_depth=use_world) / scale,
         elbow=angle,
         wrist=RelativePoint(local_x, local_y),
         depth=local_z,
@@ -432,6 +586,8 @@ def _torso_coordinates(
     pose: PoseObservation,
     source: tuple[LandmarkObservation, ...],
     wrist: LandmarkObservation,
+    *,
+    use_depth: bool,
 ) -> tuple[float, float, float, float] | None:
     """Muñeca en el plano del torso, en anchos de hombro.
 
@@ -442,24 +598,21 @@ def _torso_coordinates(
 
     left_shoulder = source[int(LandmarkId.LEFT_SHOULDER)]
     right_shoulder = source[int(LandmarkId.RIGHT_SHOULDER)]
-    axis_x = _subtract(right_shoulder, left_shoulder)
+    axis_x = _subtract(right_shoulder, left_shoulder, use_depth=use_depth)
     scale = _norm(axis_x)
     if scale <= 1e-4:
         return None
     axis_x = _scale(axis_x, 1.0 / scale)
-    center = _midpoint(left_shoulder, right_shoulder)
-    down = _body_down(pose, source, center, axis_x)
+    center = _midpoint(left_shoulder, right_shoulder, use_depth=use_depth)
+    down = _body_down(pose, source, center, axis_x, use_depth=use_depth)
     down = _reject(down, axis_x)
     down_norm = _norm(down)
     if down_norm <= 1e-4:
         return None
     axis_y = _scale(down, 1.0 / down_norm)
     axis_z = _cross(axis_x, axis_y)
-    offset = (
-        wrist.x - center[0],
-        wrist.y - center[1],
-        wrist.z - center[2],
-    )
+    wrist_point = _coordinates(wrist, use_depth=use_depth)
+    offset = tuple(wrist_point[index] - center[index] for index in range(3))
     return (
         _dot(offset, axis_x) / scale,
         _dot(offset, axis_y) / scale,
@@ -473,13 +626,18 @@ def _body_down(
     source: tuple[LandmarkObservation, ...],
     center: tuple[float, float, float],
     axis_x: tuple[float, float, float],
+    *,
+    use_depth: bool,
 ) -> tuple[float, float, float]:
     hip_index = int(LandmarkId.LEFT_HIP)
     if len(source) > int(LandmarkId.RIGHT_HIP):
         left_hip = source[hip_index]
         right_hip = source[int(LandmarkId.RIGHT_HIP)]
-        if _finite_point(left_hip) and _finite_point(right_hip):
-            hip_center = _midpoint(left_hip, right_hip)
+        if (
+            left_hip.is_reliable(_POSE_MIN_VISIBILITY, _POSE_MIN_PRESENCE)
+            and right_hip.is_reliable(_POSE_MIN_VISIBILITY, _POSE_MIN_PRESENCE)
+        ):
+            hip_center = _midpoint(left_hip, right_hip, use_depth=use_depth)
             return (
                 hip_center[0] - center[0],
                 hip_center[1] - center[1],
@@ -490,15 +648,47 @@ def _body_down(
     return _reject(fallback, axis_x) if _norm(_reject(fallback, axis_x)) > 1e-4 else (0.0, 0.0, 1.0)
 
 
-def _subtract(first: LandmarkObservation, second: LandmarkObservation) -> tuple[float, float, float]:
-    return (first.x - second.x, first.y - second.y, first.z - second.z)
+_POSE_MIN_VISIBILITY = 0.5
+_POSE_MIN_PRESENCE = 0.5
 
 
-def _midpoint(first: LandmarkObservation, second: LandmarkObservation) -> tuple[float, float, float]:
-    return (
-        (first.x + second.x) / 2.0,
-        (first.y + second.y) / 2.0,
-        (first.z + second.z) / 2.0,
+def _source_is_reliable(
+    source: tuple[LandmarkObservation, ...],
+    required: tuple[LandmarkId, ...],
+) -> bool:
+    return bool(source) and all(
+        index < len(source)
+        and source[int(index)].is_reliable(_POSE_MIN_VISIBILITY, _POSE_MIN_PRESENCE)
+        for index in required
+    )
+
+
+def _coordinates(point: LandmarkObservation, *, use_depth: bool) -> tuple[float, float, float]:
+    return (point.x, point.y, point.z if use_depth else 0.0)
+
+
+def _subtract(
+    first: LandmarkObservation,
+    second: LandmarkObservation,
+    *,
+    use_depth: bool = True,
+) -> tuple[float, float, float]:
+    first_coordinates = _coordinates(first, use_depth=use_depth)
+    second_coordinates = _coordinates(second, use_depth=use_depth)
+    return tuple(first_coordinates[index] - second_coordinates[index] for index in range(3))
+
+
+def _midpoint(
+    first: LandmarkObservation,
+    second: LandmarkObservation,
+    *,
+    use_depth: bool = True,
+) -> tuple[float, float, float]:
+    first_coordinates = _coordinates(first, use_depth=use_depth)
+    second_coordinates = _coordinates(second, use_depth=use_depth)
+    return tuple(
+        (first_coordinates[index] + second_coordinates[index]) / 2.0
+        for index in range(3)
     )
 
 
@@ -541,8 +731,33 @@ def _finite_point(point: LandmarkObservation) -> bool:
     return point.is_finite
 
 
-def _distance3(first: LandmarkObservation, second: LandmarkObservation) -> float:
-    return math.dist((first.x, first.y, first.z), (second.x, second.y, second.z))
+def _distance(
+    first: LandmarkObservation,
+    second: LandmarkObservation,
+    *,
+    use_depth: bool,
+) -> float:
+    return math.dist(
+        _coordinates(first, use_depth=use_depth),
+        _coordinates(second, use_depth=use_depth),
+    )
+
+
+def _angle2(
+    first: LandmarkObservation,
+    vertex: LandmarkObservation,
+    third: LandmarkObservation,
+) -> float | None:
+    vector_a = (first.x - vertex.x, first.y - vertex.y)
+    vector_b = (third.x - vertex.x, third.y - vertex.y)
+    norm_a = math.hypot(*vector_a)
+    norm_b = math.hypot(*vector_b)
+    if norm_a <= 1e-8 or norm_b <= 1e-8:
+        return None
+    cosine = (vector_a[0] * vector_b[0] + vector_a[1] * vector_b[1]) / (norm_a * norm_b)
+    cosine = max(-1.0, min(1.0, cosine))
+    angle = math.degrees(math.acos(cosine))
+    return angle if math.isfinite(angle) else None
 
 
 def _angle3(
@@ -576,12 +791,22 @@ class HeuristicClassifier:
         self.telemetry = {
             "left_extension": None,
             "right_extension": None,
+            "left_elbow_angle": None,
+            "right_elbow_angle": None,
             "left_speed": 0.0,
             "right_speed": 0.0,
             "left_lateral": 0.0,
             "right_lateral": 0.0,
             "left_phase": STATUS_NEUTRAL,
             "right_phase": STATUS_NEUTRAL,
+            "left_event_start_ms": None,
+            "left_event_end_ms": None,
+            "right_event_start_ms": None,
+            "right_event_end_ms": None,
+            "left_cooldown_until_ms": -1,
+            "right_cooldown_until_ms": -1,
+            "left_rejection": None,
+            "right_rejection": None,
         }
 
     def reset(self) -> None:
@@ -620,12 +845,22 @@ class HeuristicClassifier:
         self.telemetry = {
             "left_extension": left.extension,
             "right_extension": right.extension,
-            "left_speed": left.speed,
-            "right_speed": right.speed,
+            "left_elbow_angle": left.elbow,
+            "right_elbow_angle": right.elbow,
             "left_lateral": left.lateral,
             "right_lateral": right.lateral,
+            "left_speed": left.speed,
+            "right_speed": right.speed,
             "left_phase": left.phase,
             "right_phase": right.phase,
+            "left_event_start_ms": left.event_start_ms,
+            "left_event_end_ms": left.event_end_ms,
+            "right_event_start_ms": right.event_start_ms,
+            "right_event_end_ms": right.event_end_ms,
+            "left_cooldown_until_ms": left.cooldown_until_ms,
+            "right_cooldown_until_ms": right.cooldown_until_ms,
+            "left_rejection": left.rejection,
+            "right_rejection": right.rejection,
         }
         latency_ms = (time.perf_counter() - started) * 1000.0
         rejection = left.rejection or right.rejection
@@ -643,11 +878,10 @@ class HeuristicClassifier:
                 latency_ms=latency_ms,
                 sensitivity=self.settings.profile_name,
                 debug_lines=debug_lines,
+                diagnostics=_decision_diagnostics(left, right),
             )
 
-        events = tuple(
-            event for event in (left.event, right.event) if event is not None
-        )
+        events = _select_events(left, right)
         if events:
             latest = events[-1]
             return ClassificationResult(
@@ -660,6 +894,7 @@ class HeuristicClassifier:
                 latency_ms=latency_ms,
                 sensitivity=self.settings.profile_name,
                 debug_lines=debug_lines,
+                diagnostics=_decision_diagnostics(left, right),
             )
         if left.unknown or right.unknown:
             arm = "left" if left.unknown else "right"
@@ -670,6 +905,7 @@ class HeuristicClassifier:
                 latency_ms=latency_ms,
                 sensitivity=self.settings.profile_name,
                 debug_lines=debug_lines,
+                diagnostics=_decision_diagnostics(left, right),
             )
 
         phase, arm = _dominant_phase(left, right)
@@ -682,6 +918,7 @@ class HeuristicClassifier:
                 sensitivity=self.settings.profile_name,
                 moving=moving,
                 debug_lines=debug_lines,
+                diagnostics=_decision_diagnostics(left, right),
             )
         return ClassificationResult(
             source=self.name,
@@ -695,6 +932,7 @@ class HeuristicClassifier:
             sensitivity=self.settings.profile_name,
             moving=True,
             debug_lines=debug_lines,
+            diagnostics=_decision_diagnostics(left, right),
         )
 
 
@@ -704,8 +942,63 @@ def _fmt(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def _decision_diagnostics(left: _ArmDecision, right: _ArmDecision) -> dict[str, object]:
+    """Expone la causa terminal por brazo sin convertirla en una etiqueta."""
+
+    return {
+        "left_phase": left.phase,
+        "right_phase": right.phase,
+        "left_rejection": left.rejection,
+        "right_rejection": right.rejection,
+        "left_event_start_ms": left.event_start_ms,
+        "left_event_end_ms": left.event_end_ms,
+        "right_event_start_ms": right.event_start_ms,
+        "right_event_end_ms": right.event_end_ms,
+        "left_cooldown_until_ms": left.cooldown_until_ms,
+        "right_cooldown_until_ms": right.cooldown_until_ms,
+        "left_tracking": left.tracking,
+        "right_tracking": right.tracking,
+        "left_movement_detected": left.phase != STATUS_NEUTRAL,
+        "right_movement_detected": right.phase != STATUS_NEUTRAL,
+        "left_candidate": left.candidate,
+        "right_candidate": right.candidate,
+        "left_classification_reason": left.classification_reason,
+        "right_classification_reason": right.classification_reason,
+        "left_speed": left.speed,
+        "right_speed": right.speed,
+        "left_lateral": left.lateral,
+        "right_lateral": right.lateral,
+        "left_extension": left.extension,
+        "right_extension": right.extension,
+        "left_elbow_angle": left.elbow,
+        "right_elbow_angle": right.elbow,
+    }
+
+
 def _is_moving(left: _ArmDecision, right: _ArmDecision) -> bool:
     return left.phase != STATUS_NEUTRAL or right.phase != STATUS_NEUTRAL
+
+
+def _motion_mass(decision: _ArmDecision) -> float:
+    return max(0.0, decision.peak_extension) + max(0.0, decision.peak_lateral)
+
+
+def _select_events(left: _ArmDecision, right: _ArmDecision) -> tuple[PunchEvent, ...]:
+    """Un fotograma no entrega dos golpes si uno es compensación de guardia."""
+
+    if left.event is None and right.event is None:
+        return ()
+    if left.event is None:
+        return (right.event,)
+    if right.event is None:
+        return (left.event,)
+    left_mass = _motion_mass(left)
+    right_mass = _motion_mass(right)
+    if left_mass >= max(0.08, right_mass * 2.0) and right_mass < left_mass:
+        return (left.event,)
+    if right_mass >= max(0.08, left_mass * 2.0) and left_mass < right_mass:
+        return (right.event,)
+    return (left.event, right.event)
 
 
 def _preferred_candidate(left: _ArmDecision, right: _ArmDecision) -> str | None:

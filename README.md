@@ -53,12 +53,16 @@ python main.py
 Recopilación de muestras etiquetadas:
 
 ```bash
-python main.py --mode collect
+python main.py --mode collect --consent
 ```
 
 Ambos modos aceptan `--camera-index`, `--width`, `--height`, `--no-mirror` y
 `--model`. La recopilación también acepta `--data-dir`; su valor predeterminado
 es `data/`.
+
+`--consent` confirma explícitamente la captura local. La persona elige la
+etiqueta y revisa visualmente el esqueleto en la ventana antes de continuar;
+solo se guardan muestras biomecánicas validadas, nunca imágenes, video ni audio.
 
 Controles:
 
@@ -240,8 +244,11 @@ El modo abre la webcam, dibuja el seguimiento y muestra contadores. La sesión
 empieza contando. `P` o la barra espaciadora pausan y reanudan, `R` reinicia y
 `Q` cierra. En el perfil normal un golpe se cuenta cuando el brazo completa
 salida y regreso; dejar el brazo extendido no acumula repeticiones. La
-extensión se mide en tres dimensiones, porque un golpe hacia la cámara casi no
-alarga el brazo en la imagen plana.
+extensión usa coordenadas mundiales 3D solo cuando hombros, codo y muñeca son
+fiables; si no, conserva una medición 2D y no inventa profundidad. La
+clasificación de recto prioriza la extensión y apertura temporal del codo sobre
+una proyección lateral, para no convertir automáticamente un jab/cross en
+gancho.
 
 Con `--classifier heuristic` el panel indica `MODELO: HEURISTICO`. Reconoce
 guardia, jab izquierdo, cross derecho, gancho izquierdo y gancho derecho en
@@ -255,6 +262,35 @@ con el que arrancó. `D` muestra el diagnóstico y `C` ejecuta una calibración
 de unos 14 segundos. Esa rutina solo propone umbrales; no crea muestras para
 NEAT.
 
+Para una calibración individual auditable usa el modo separado. Primero muestra
+un preflight de cámara con hombros, codos, muñecas, caderas, calidad por brazo,
+ángulos y FPS; después guía guardia inmóvil, movimiento suave y cinco intentos
+de cada golpe. En pantalla `F` registra frontal, `A` registra 30--45 grados y
+`ENTER` comienza. Cada intento exige revisión humana: `Y/ENTER` confirma, `0-4`
+corrige, `R` repite y `X` excluye.
+
+```bash
+python main.py --mode calibrate --classifier heuristic
+```
+
+La sesión queda en `results/calibrations/<id>/` con `calibration.json`,
+`attempts.csv`, `visibility.csv` y `params.json`. Incluye el respaldo de los
+parámetros actuales y una propuesta basada únicamente en los intentos
+confirmados; no aplica la propuesta automáticamente y no crea muestras de
+entrenamiento. Si se hacen sesiones frontal y a 30--45 grados, también crea
+`results/calibrations/comparison.json/csv`; solo elige una orientación si la
+calidad media de landmarks realmente difiere.
+
+Tras revisar manualmente `params.json`, una prueba piloto explícita puede usar
+la propuesta así:
+
+```bash
+python main.py --mode benchmark --classifier heuristic --calibration results/calibrations/<id>/calibration.json --repetitions 5 --no-save-samples
+```
+
+La aplicación no aplica una calibración por el mero hecho de que exista el
+archivo.
+
 ```bash
 python main.py --mode live --classifier heuristic --training-style sparring
 ```
@@ -265,9 +301,10 @@ secuencias sintéticas y no demuestran la precisión frente a la webcam.
 ## Evaluación guiada
 
 ```bash
-python main.py --mode benchmark --classifier heuristic --sensitivity normal
-python main.py --mode benchmark --classifier heuristic --sensitivity high
-python main.py --mode benchmark --classifier external --sensitivity maximum
+python main.py --mode benchmark --classifier heuristic --sensitivity normal --no-save-samples
+python main.py --mode benchmark --classifier heuristic --sensitivity high --no-save-samples
+python main.py --mode benchmark --classifier neat --neat-model results/20261012T001458_initial/model --no-save-samples
+python main.py --mode benchmark --classifier external --sensitivity normal --no-save-samples
 ```
 
 La pantalla pide prepararse, ejecutar el movimiento, volver a guardia y pasar
@@ -275,24 +312,51 @@ a la siguiente repetición. Son 10 repeticiones de jab izquierdo, cross derecho,
 gancho izquierdo, gancho derecho y guardia. `--repetitions`, `--prepare-ms`,
 `--active-ms` y `--return-ms` cambian esos intervalos.
 
-`Y` confirma que ejecutaste el movimiento pedido. `0` a `4` corrigen la
-etiqueta antes de confirmar. `X` excluye la repetición. Una predicción durante
-el intervalo no cuenta como acierto hasta ese paso. Cada predicción se empareja
-como máximo con un golpe verificado.
+`Y` confirma que ejecutaste correctamente el movimiento pedido. `0` a `4`
+indican qué clase ejecutaste realmente antes de confirmar. `R` repite el mismo
+intento sin incluirlo en las métricas. `X` marca la ejecución como incorrecta o
+inválida, la conserva en el CSV y la excluye de las métricas. Una predicción durante el intervalo no
+cuenta como acierto hasta ese paso. Cada predicción se empareja como máximo con
+un golpe verificado.
 
-Los informes quedan en `results/benchmarks/<sensibilidad>/<fecha>/` como JSON,
-CSV y, si hay al menos una repetición verificada de cada clase, una matriz.
+Los informes quedan en `results/benchmarks/<sensibilidad>/<fecha>/`. Además de
+`metrics.json`, `metrics.csv`, `events.csv` y la matriz, `attempts.csv` contiene
+una fila por intento, incluso si no hubo detección. Conserva seguimiento,
+ángulos, trayectoria de muñecas, velocidades, fases, cooldown, puntuaciones,
+latencia, FPS y el diagnóstico observado. Las métricas de reconocimiento y el
+auditor del contador se guardan por separado.
+`diagnostic_audit.json` y `diagnostic_audit.csv` pueden regenerarse para revisar
+un informe existente sin sobrescribir sus archivos originales.
+`metric_reconciliation.json` y `metric_reconciliation.csv` separan explícitamente
+aciertos, clases incorrectas, golpes sin detección, falsos positivos de guardia,
+predicciones adicionales, duplicados y eventos del contador dentro de esa misma
+sesión. Así, cinco clases incorrectas y dos falsos positivos de guardia no se
+presentan como siete golpes mal clasificados.
 La comparación entre perfiles no elige un ganador por haber detectado más
-golpes. Las ventanas confirmadas se guardan en `data/` con el esquema de NEAT,
-sin imágenes ni video. `--no-save-samples` omite ese guardado. Si el intervalo
-activo no dura entre 1.5 y 2.8 segundos, la muestra no supera la validación
-existente.
+golpes. Para una evaluación pura de webcam usa `--no-save-samples`: así las
+ventanas confirmadas no se agregan a `data/` ni afectan entrenamientos futuros.
+Si el intervalo activo no dura entre 1.5 y 2.8 segundos, la muestra no supera
+la validación existente.
+
+Las clases nativas son distintas por clasificador. Heurístico y NEAT devuelven
+`guardia_neutral`, `jab_izquierdo`, `cross_derecho`, `gancho_izquierdo` y
+`gancho_derecho`. El externo devuelve `jab`, `cross`, `hook` y `uppercut`.
+Solo un `hook` con brazo dominante claro se mapea a un gancho izquierdo o
+derecho; el sistema no convierte `uppercut`, `jab`, `cross` o un `HOOK`
+ambiguo en una clase 0–4 inventada.
 
 `--classifier neat` carga el genoma de `--neat-model` o, si no se indica, el
 `winner.pkl` más reciente de `results/`. Reutiliza el orden de características,
 la normalización y la ventana temporal guardadas en el entrenamiento. Si no hay
 modelo, el programa se detiene y no sustituye el resultado por el detector
 provisional.
+
+La auditoría de fuentes externas, el estado de descargas y las reglas de
+conversión están en [`docs/external_datasets.md`](docs/external_datasets.md) y
+[`data/external/manifest.json`](data/external/manifest.json). La carpeta de
+datos externos está vacía de videos a propósito: una etiqueta pública o un
+enlace de Google Drive/YouTube no demuestra por sí solo permiso para copiar el
+contenido subyacente.
 
 El clasificador externo usa el LSTM de
 [ACM40960/Boxing](https://github.com/ACM40960/Boxing), licencia MIT, copyright
@@ -388,7 +452,10 @@ modelo NEAT dentro del juego queda para la entrega final.
 - `app/dataset_manager.py`: JSON atómico, sesiones e índice CSV.
 - `app/evolution/`: auditoría, vectores temporales, división, NEAT, métricas, gráficas y reporte académico.
 - `app/trainer/`: detector provisional, adaptador NEAT, YOLO + LSTM y sesión.
+- `app/trainer/preflight.py`: visibilidad, calidad por brazo y registro de cámara.
+- `app/trainer/calibration_session.py`: calibración individual guiada y propuestas.
 - `app/benchmark/`: rutina guiada, emparejamiento y reportes de evaluación.
+- `app/external_data/`: conversión auditable de etiquetas externas y exclusiones.
 - `app/targets/`: objetivos, impactos, captura provisional y revisión.
 - `config/neat_feedforward.cfg`: plantilla de evolución feedforward.
 - `models/`: modelo oficial Pose Landmarker Lite y pesos externos en `models/external/`.

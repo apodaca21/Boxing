@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from app.dataset_manager import MOVEMENTS
 from app.game.combo import ComboTracker
+from app.trainer.counting import PunchLedger, rows_for
 from app.trainer.results import ClassificationResult
 
 
@@ -23,6 +24,8 @@ class FreeSnapshot:
     classifier: str
     message: str
     punches_per_minute: float | None
+    named_counts: dict[str, int]
+    rows: tuple[tuple[str, int, str], ...]
 
 
 class FreeRound:
@@ -39,7 +42,9 @@ class FreeRound:
         self.duration_ms = duration_ms
         self.countdown_ms = countdown_ms
         self.phase = "idle"
-        self.counts = {label: 0 for label in range(1, 5)}
+        self._ledger = PunchLedger()
+        self.counts = self._ledger.counts
+        self.named_counts = self._ledger.named_counts
         self.total = 0
         self.last_punch = "—"
         self.uncertain = 0
@@ -47,7 +52,6 @@ class FreeRound:
         self._combo = ComboTracker()
         self._mark_ms: int | None = None
         self._elapsed = 0
-        self._held: set[tuple[int | None, str | None]] = set()
         self._uncertain_open = True
 
     def handle_key(self, key: int) -> bool:
@@ -92,27 +96,21 @@ class FreeRound:
                 self._uncertain_open = False
             self.message = "MOVIMIENTO NO CONFIRMADO"
             self._combo.clear()
-            self._held.clear()
+            self._ledger.release()
             return
         self._uncertain_open = True
-        current = {
-            (event.label_id, event.arm)
-            for event in result.events
-            if event.label_id in self.counts
-        }
         if not result.events:
-            self._held.clear()
+            self._ledger.release()
             if result.label_id == 0:
                 self.message = MOVEMENTS[0].display_name
             return
-        fresh = current - self._held
-        self._held = current
         for event in result.events:
-            if (event.label_id, event.arm) not in fresh:
+            if not self._ledger.commit(event):
                 continue
-            self.counts[event.label_id] += 1
-            self.total += 1
-            self.last_punch = event.display_name
+            self.counts = self._ledger.counts
+            self.named_counts = self._ledger.named_counts
+            self.total = self._ledger.total
+            self.last_punch = self._ledger.last_punch
             self.message = event.display_name
             self._combo.add(now_ms, event.label_id, event.display_name)
 
@@ -140,6 +138,8 @@ class FreeRound:
             classifier=self.classifier_name,
             message=self.message,
             punches_per_minute=pace,
+            named_counts=dict(self.named_counts),
+            rows=rows_for(self.classifier_name, self.counts, self.named_counts),
         )
 
     def record(self) -> dict[str, object]:
@@ -152,6 +152,11 @@ class FreeRound:
             "elapsed_ms": view.elapsed_ms,
             "total": view.total,
             "counts": {str(label): count for label, count in view.counts.items()},
+            "named_counts": dict(view.named_counts),
+            "punch_rows": [
+                {"name": name, "count": count, "side": side}
+                for name, count, side in view.rows
+            ],
             "longest_combo": view.longest_combo,
             "punches_per_minute": view.punches_per_minute,
             "uncertain": view.uncertain,

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app.dataset_manager import MOVEMENTS
+from app.trainer.counting import PunchLedger, event_identity, rows_for
 from app.trainer.results import ClassificationResult
 
 
@@ -42,8 +43,9 @@ class TrainingSession:
 
     def __init__(self) -> None:
         self.running = True
-        self.counts = {label_id: 0 for label_id in range(1, 5)}
-        self.named_counts: dict[str, int] = {}
+        self._ledger = PunchLedger()
+        self.counts = self._ledger.counts
+        self.named_counts = self._ledger.named_counts
         self.punch_total = 0
         self.last_punch = "—"
         self.recognition = MOVEMENTS[0].display_name
@@ -64,8 +66,9 @@ class TrainingSession:
 
     def reset(self) -> None:
         self.running = True
-        self.counts = {label_id: 0 for label_id in range(1, 5)}
-        self.named_counts = {}
+        self._ledger.reset()
+        self.counts = self._ledger.counts
+        self.named_counts = self._ledger.named_counts
         self.punch_total = 0
         self.last_punch = "—"
         self.recognition = MOVEMENTS[0].display_name
@@ -107,13 +110,18 @@ class TrainingSession:
             self.recognition = result.display_name
         if not self.running:
             return
+        if not result.events:
+            self._ledger.release()
         for event in result.events:
-            self.punch_total += 1
-            if event.counter_key:
-                self.named_counts[event.counter_key] = self.named_counts.get(event.counter_key, 0) + 1
-            elif event.label_id in self.counts:
-                self.counts[event.label_id] += 1
-            self.last_punch = event.display_name
+            if event.event_id is None:
+                key, arm = event_identity(event)
+                event = replace(event, event_id=f"session:{timestamp_ms}:{arm}:{key}")
+            if not self._ledger.commit(event):
+                continue
+            self.counts = self._ledger.counts
+            self.named_counts = self._ledger.named_counts
+            self.punch_total = self._ledger.total
+            self.last_punch = self._ledger.last_punch
             self._highlight_arm = event.arm
             self._highlight_until_ms = timestamp_ms + HIGHLIGHT_MS
 
@@ -152,16 +160,4 @@ class TrainingSession:
         )
 
     def _rows(self) -> tuple[tuple[str, int, str], ...]:
-        if self.source == "external":
-            return (
-                ("Jab", self.named_counts.get("jab", 0), "neutral"),
-                ("Cross", self.named_counts.get("cross", 0), "neutral"),
-                ("Gancho izquierdo", self.counts[3], "left"),
-                ("Gancho derecho", self.counts[4], "right"),
-                ("HOOK", self.named_counts.get("hook", 0), "neutral"),
-                ("Uppercut", self.named_counts.get("uppercut", 0), "neutral"),
-            )
-        return tuple(
-            (MOVEMENTS[label_id].display_name, self.counts[label_id], "left" if label_id in (1, 3) else "right")
-            for label_id in range(1, 5)
-        )
+        return rows_for(self.source, self.counts, self.named_counts)

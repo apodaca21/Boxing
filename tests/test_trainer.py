@@ -16,7 +16,7 @@ from app.geometry import BiomechanicalFeatures, RelativePoint
 from app.overlay import render_frame
 from app.pose_tracker import LandmarkId, LandmarkObservation, PoseObservation
 from app.trainer.factory import create_classifier
-from app.trainer.heuristic import HeuristicClassifier, HeuristicSettings
+from app.trainer.heuristic import HeuristicClassifier, HeuristicSettings, _arm_observation
 from app.trainer.neat_classifier import ClassifierUnavailable, NeatClassifier
 from app.trainer.results import (
     STATUS_NO_DETECTION,
@@ -271,6 +271,132 @@ class HeuristicDetectorTests(unittest.TestCase):
             [event.label_id for result in results for event in result.events],
             [1],
         )
+
+    def test_lateral_projection_with_progressive_elbow_opening_is_a_jab(self) -> None:
+        """Una proyección lateral no debe convertir un recto en gancho."""
+
+        frames = []
+        positions = (-0.30, -0.30, -0.52, -0.78, -1.00, -1.00, -0.70, -0.42, -0.30)
+        extensions = (0.90, 0.90, 1.20, 1.55, 1.90, 2.10, 1.70, 1.30, 0.90)
+        elbows = (90, 90, 130, 155, 168, 172, 160, 120, 90)
+        for index, (x, extension, elbow) in enumerate(zip(positions, extensions, elbows, strict=True)):
+            frames.append(
+                _features(
+                    index * 40,
+                    left_x=x,
+                    left_extension=extension,
+                    left_elbow=elbow,
+                )
+            )
+
+        results = _feed(self.classifier, frames)
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [1],
+        )
+        completed = [result for result in results if result.counted]
+        self.assertIn("recto", completed[0].diagnostics["left_classification_reason"])
+
+    def test_two_jabs_and_jab_cross_use_independent_arm_recovery(self) -> None:
+        first = _straight_cycle(0, side="left")
+        guard = [_guard(480), _guard(520), _guard(560)]
+        second = _straight_cycle(600, side="left")
+        results = _feed(self.classifier, first + guard + second)
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [1, 1],
+        )
+
+        classifier = HeuristicClassifier(HeuristicSettings(smooth_alpha=1.0))
+        left = _straight_cycle(0, side="left")
+        right = _straight_cycle(600, side="right")
+        results = _feed(classifier, left + [_guard(440), _guard(480), _guard(520)] + right)
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [1, 2],
+        )
+
+    def test_partial_return_closes_one_event_without_duplicate(self) -> None:
+        frames = _straight_cycle(0, side="left")[:-2]
+        frames.extend(
+            _features(timestamp, left_extension=extension, left_elbow=elbow)
+            for timestamp, extension, elbow in (
+                (360, 1.20, 130),
+                (400, 1.10, 110),
+            )
+        )
+        results = _feed(self.classifier, frames)
+        self.assertEqual(sum(len(result.events) for result in results), 1)
+
+    def test_fast_cycle_uses_timestamps_and_still_closes(self) -> None:
+        results = _feed(self.classifier, _straight_cycle(0, side="right", step_ms=10))
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [2],
+        )
+
+    def test_brief_wrist_loss_is_tolerated_but_insufficient_tracking_is_not(self) -> None:
+        frames = _straight_cycle(0, side="left")
+        results = []
+        for index, frame in enumerate(frames):
+            if index == 4:
+                frame = _features(frame.timestamp_ms, left_missing=True)
+            results.append(self.classifier.update(frame, pose_detected=True))
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [1],
+        )
+
+        classifier = HeuristicClassifier(HeuristicSettings(smooth_alpha=1.0))
+        frames = _straight_cycle(0, side="left")[:5]
+        frames.extend(
+            _features(200 + index * 40, left_missing=True, right_missing=True)
+            for index in range(8)
+        )
+        results = _feed(classifier, frames)
+        self.assertFalse(any(result.counted for result in results))
+        self.assertEqual(results[-1].status, STATUS_NO_DETECTION)
+
+    def test_unreliable_world_landmarks_do_not_create_depth(self) -> None:
+        slots = [LandmarkObservation(0.0, 0.0, 99.0, 0.0, 0.0) for _ in range(17)]
+        normalized_points = {
+            int(LandmarkId.LEFT_SHOULDER): (-0.18, -0.40, 0.0),
+            int(LandmarkId.RIGHT_SHOULDER): (0.18, -0.40, 0.0),
+            int(LandmarkId.LEFT_ELBOW): (-0.22, -0.10, 0.0),
+            int(LandmarkId.LEFT_WRIST): (-0.20, 0.05, 0.0),
+        }
+        for index, point in normalized_points.items():
+            slots[index] = LandmarkObservation(*point, 1.0, 1.0)
+        pose = PoseObservation(0, tuple(slots), tuple(slots))
+        observation = _arm_observation(_guard(0), "left", pose)
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual(observation.depth, 0.0)
+
+    def test_ambiguous_cycle_does_not_renew_cooldown(self) -> None:
+        classifier = HeuristicClassifier(
+            HeuristicSettings(smooth_alpha=1.0, cooldown_ms=300)
+        )
+        frames = _straight_cycle(0, side="left")
+        frames.extend(_guard(timestamp) for timestamp in (440, 480, 520, 560))
+        frames.extend(
+            _features(timestamp, left_extension=extension, left_elbow=95.0)
+            for timestamp, extension in (
+                (600, 0.90),
+                (640, 1.20),
+                (680, 1.50),
+                (720, 1.00),
+                (760, 0.90),
+                (800, 0.90),
+            )
+        )
+        frames.extend(_straight_cycle(840, side="left"))
+        results = _feed(classifier, frames)
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [1, 1],
+        )
+        self.assertTrue(any(result.rejection == "tipo no distinguible" for result in results))
 
 
 def _arm_pose(

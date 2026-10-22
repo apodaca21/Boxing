@@ -20,6 +20,13 @@ class PredictionMark:
     label_id: int | None
     display_name: str
     latency_ms: float | None
+    arm: str | None = None
+    event_start_ms: int | None = None
+    event_end_ms: int | None = None
+    event_duration_ms: int | None = None
+    cooldown_ms: int | None = None
+    score_labels: tuple[str, ...] = ()
+    scores: tuple[float, ...] = ()
 
 
 @dataclass
@@ -36,6 +43,7 @@ class RepetitionRecord:
     verified_label_id: int | None = None
     corrected: bool = False
     exclusion_reason: str | None = None
+    evidence: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def requested_name(self) -> str:
@@ -136,6 +144,7 @@ class BenchmarkProtocol:
         *,
         latency_ms: float | None = None,
         fps: float | None = None,
+        evidence: dict[str, object] | None = None,
     ) -> None:
         """Guarda predicciones solo dentro del intervalo de ejecución."""
 
@@ -143,14 +152,37 @@ class BenchmarkProtocol:
             return
         if fps is not None:
             self._current.fps_samples.append(fps)
+        if evidence is not None:
+            self._current.evidence.append(dict(evidence))
         for event in events:
             label_id = event.label_id if event.label_id in (1, 2, 3, 4) else None
+            event_start = _int_or_none(None if evidence is None else evidence.get("event_start_ms"))
+            event_end = _int_or_none(None if evidence is None else evidence.get("event_end_ms"))
+            duration = None
+            if event_start is not None and event_end is not None and event_end >= event_start:
+                duration = event_end - event_start
+            cooldown = _int_or_none(None if evidence is None else evidence.get("cooldown_ms"))
+            score_labels = tuple(
+                str(value)
+                for value in (() if evidence is None else evidence.get("score_labels", ()))
+            )
+            scores = tuple(
+                float(value)
+                for value in (() if evidence is None else evidence.get("scores", ()))
+            )
             self._current.predictions.append(
                 PredictionMark(
                     timestamp_ms=timestamp_ms,
                     label_id=label_id,
                     display_name=event.display_name,
                     latency_ms=latency_ms,
+                    arm=event.arm,
+                    event_start_ms=event_start,
+                    event_end_ms=event_end,
+                    event_duration_ms=duration,
+                    cooldown_ms=cooldown,
+                    score_labels=score_labels,
+                    scores=scores,
                 )
             )
 
@@ -186,6 +218,29 @@ class BenchmarkProtocol:
         self._enter_next_or_finish(record.window_end_ms or 0)
         return record
 
+    def repeat(
+        self,
+        timestamp_ms: int,
+        reason: str = "repetida por el usuario",
+    ) -> RepetitionRecord | None:
+        """Cierra el intento actual sin evaluarlo y repite la misma consigna."""
+
+        if self.phase != "review" or self._current is None:
+            return None
+        self._current.status = "repeated"
+        self._current.exclusion_reason = reason
+        requested = self._current.requested_label_id
+        repetition_index = self._current.repetition_index
+        self._pending_correction = None
+        self.phase = "prepare"
+        self._phase_started_ms = timestamp_ms
+        self._current = RepetitionRecord(
+            requested_label_id=requested,
+            repetition_index=repetition_index,
+        )
+        self.records.append(self._current)
+        return self._current
+
     def verified_records(self) -> tuple[RepetitionRecord, ...]:
         return tuple(record for record in self.records if record.status == "verified")
 
@@ -215,7 +270,8 @@ class BenchmarkProtocol:
             instruction = "Confirma tu ejecución."
             detail = (
                 f"Solicitado: {requested}. Etiqueta propuesta: {chosen}. "
-                f"Detectados: {detected}. Y confirma, 0-4 corrige, X excluye."
+                f"Detectados: {detected}. Y confirma, 0-4 corrige, R repite, "
+                "X marca ejecución incorrecta y la excluye de métricas."
             )
         progress = self._progress_text()
         return BenchmarkView(
@@ -281,3 +337,13 @@ class BenchmarkProtocol:
         self.phase = "prepare"
         self._phase_started_ms = timestamp_ms
         self._begin_repetition()
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None

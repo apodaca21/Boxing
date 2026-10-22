@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from app.config import ORTHODOX_STANCE, STANCE_DESCRIPTION
@@ -71,6 +72,8 @@ class NeatClassifier:
         self._released = True
         self._peak = 0.0
         self._arm_ready_ms = {"left": -1, "right": -1}
+        self._event_id: str | None = None
+        self._cycle_started_ms: int | None = None
 
     @classmethod
     def from_model(cls, model: EvolvedModel) -> NeatClassifier:
@@ -91,6 +94,8 @@ class NeatClassifier:
         self._released = True
         self._peak = 0.0
         self._arm_ready_ms = {"left": -1, "right": -1}
+        self._event_id: str | None = None
+        self._cycle_started_ms: int | None = None
 
     def update(
         self,
@@ -127,6 +132,7 @@ class NeatClassifier:
         timestamp_ms: int,
         outputs: tuple[float, ...],
     ) -> ClassificationResult:
+        score_labels = tuple(MOVEMENTS[index].name for index in range(len(outputs)))
         ordered = sorted(outputs, reverse=True)
         margin = ordered[0] - ordered[1]
         if label != 0 and margin < self._min_margin:
@@ -136,6 +142,9 @@ class NeatClassifier:
                 label_id=None,
                 display_name="MOVIMIENTO NO CONFIRMADO",
                 rejection="margen insuficiente",
+                score_labels=score_labels,
+                scores=outputs,
+                diagnostics={"margin": margin, "min_margin": self._min_margin},
             )
 
         if label == 0:
@@ -144,23 +153,37 @@ class NeatClassifier:
             if self._neutral_streak >= self._neutral_frames_to_release:
                 self._latched_label = None
                 self._released = True
-            return neutral_result(self.name)
+                self._event_id = None
+                self._cycle_started_ms = None
+            return replace(
+                neutral_result(self.name),
+                score_labels=score_labels,
+                scores=outputs,
+            )
 
         self._neutral_streak = 0
         movement = MOVEMENTS[label]
         arm = _arm_for_label(label)
         activation = outputs[label]
-        if self._latched_label == label:
+        if self._latched_label is not None and not self._released:
             dipped = activation < self._peak - self._retrigger_dip
-            if dipped:
+            if self._latched_label == label and dipped:
                 self._released = True
             self._peak = max(self._peak, activation)
-            if dipped or not self._released or timestamp_ms < self._arm_ready_ms[arm]:
+            if not self._released or timestamp_ms < self._arm_ready_ms[arm]:
                 return ClassificationResult(
                     source=self.name,
                     status=STATUS_EXTENDING,
                     label_id=None,
                     display_name=movement.display_name,
+                    score_labels=score_labels,
+                    scores=outputs,
+                    diagnostics={
+                        "margin": margin,
+                        "cooldown_until_ms": self._arm_ready_ms[arm],
+                        "arm": arm,
+                        "event_id": self._event_id,
+                    },
                 )
         elif timestamp_ms < self._arm_ready_ms[arm]:
             return ClassificationResult(
@@ -168,13 +191,31 @@ class NeatClassifier:
                 status=STATUS_EXTENDING,
                 label_id=None,
                 display_name=movement.display_name,
+                score_labels=score_labels,
+                scores=outputs,
+                diagnostics={
+                    "margin": margin,
+                    "cooldown_until_ms": self._arm_ready_ms[arm],
+                    "arm": arm,
+                },
             )
 
         self._latched_label = label
         self._released = False
         self._peak = activation
         self._arm_ready_ms[arm] = timestamp_ms + self._cooldown_ms
-        event = PunchEvent(movement.label_id, movement.display_name, arm)
+        self._cycle_started_ms = timestamp_ms
+        self._event_id = f"neat:{timestamp_ms}:{arm}"
+        event = PunchEvent(
+            movement.label_id,
+            movement.display_name,
+            arm,
+            event_id=self._event_id,
+            started_ms=timestamp_ms,
+            ended_ms=timestamp_ms,
+            confirmed=True,
+            source=self.name,
+        )
         return ClassificationResult(
             source=self.name,
             status="completado",
@@ -182,6 +223,13 @@ class NeatClassifier:
             display_name=movement.display_name,
             events=(event,),
             active_arm=event.arm,
+            score_labels=score_labels,
+            scores=outputs,
+            diagnostics={
+                "margin": margin,
+                "cooldown_until_ms": self._arm_ready_ms[arm],
+                "arm": arm,
+            },
         )
 
 

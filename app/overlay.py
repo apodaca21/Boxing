@@ -784,6 +784,7 @@ def render_frame(
     live: LiveView | None = None,
     benchmark: BenchmarkView | None = None,
     targets: TargetView | None = None,
+    overlay: bool = True,
 ) -> NDArray[np.uint8]:
     """Devuelve una vista anotada sin modificar el fotograma de captura."""
 
@@ -795,6 +796,8 @@ def render_frame(
     if pose.detected:
         highlight = None if live is None else live.highlight_arm
         _draw_skeleton(output, pose, config, highlight)
+    if not overlay:
+        return output
     if targets is not None:
         _draw_targets(output, targets, fps)
     elif live is not None:

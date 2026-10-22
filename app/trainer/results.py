@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.dataset_manager import MOVEMENTS
 
@@ -32,6 +32,11 @@ class PunchEvent:
     display_name: str
     arm: str | None
     counter_key: str | None = None
+    event_id: str | None = None
+    started_ms: int | None = None
+    ended_ms: int | None = None
+    confirmed: bool = True
+    source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +55,9 @@ class ClassificationResult:
     sensitivity: str | None = None
     moving: bool = False
     debug_lines: tuple[str, ...] = ()
+    score_labels: tuple[str, ...] = ()
+    scores: tuple[float, ...] = ()
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
     @property
     def counted(self) -> bool:

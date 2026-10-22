@@ -9,7 +9,12 @@ import unittest
 
 from app.benchmark.matching import evaluate_repetitions
 from app.benchmark.protocol import BenchmarkProtocol, PredictionMark, RepetitionRecord
-from app.benchmark.report import update_comparison, write_session_report
+from app.benchmark.report import (
+    _diagnose_record,
+    reconciliation_metrics,
+    update_comparison,
+    write_session_report,
+)
 from app.benchmark.samples import VerifiedSampleStore
 from app.config import AppConfig
 from app.dataset_manager import (
@@ -52,6 +57,19 @@ def _verified(
 
 
 class MatchingTests(unittest.TestCase):
+    def test_reconciliation_separates_wrong_classes_from_guard_false_positives(self) -> None:
+        records = (
+            _verified(0, 0, 1000, [_mark(100, 1)]),
+            _verified(1, 1000, 2000, [_mark(1500, 2)]),
+            _verified(2, 2000, 3000, []),
+        )
+        metrics = evaluate_repetitions(records, tolerance_ms=0)
+        reconciliation = reconciliation_metrics(metrics, records)
+        self.assertEqual(reconciliation["punch_wrong_classifications"], 1)
+        self.assertEqual(reconciliation["punch_no_detection"], 1)
+        self.assertEqual(reconciliation["guard_false_positives"], 1)
+        self.assertEqual(reconciliation["reported_incorrect_detections"], 2)
+
     def test_one_prediction_matches_only_one_verified_punch(self) -> None:
         records = (
             _verified(1, 0, 1000, [_mark(500, 1)]),
@@ -62,6 +80,19 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(metrics.scores[1].true_positives, 1)
         self.assertEqual(metrics.scores[1].false_negatives, 1)
         self.assertAlmostEqual(metrics.scores[1].recall or 0, 0.5)
+
+    def test_diagnosis_uses_terminal_evidence(self) -> None:
+        record = _verified(1, 0, 1000, [])
+        record.evidence = [
+            {"rejection": "cooldown", "phase": "neutral"},
+            {"rejection": "sin compromiso", "phase": "neutral"},
+        ]
+        self.assertEqual(_diagnose_record(record), "activacion_insuficiente")
+
+        record.evidence = [
+            {"rejection": "cooldown", "phase": "neutral", "cooldown_active": True, "cooldown_remaining_ms": 120},
+        ]
+        self.assertEqual(_diagnose_record(record), "cooldown")
 
     def test_overlapping_windows_do_not_share_a_prediction(self) -> None:
         records = (
@@ -185,6 +216,18 @@ class ProtocolTests(unittest.TestCase):
             "Siguiente repetición.",
         )
 
+    def test_repeat_keeps_the_attempt_out_of_verified_metrics(self) -> None:
+        protocol = self._protocol()
+        protocol.advance(100)
+        protocol.advance(200)
+        protocol.advance(300)
+        repeated = protocol.repeat(300)
+        assert repeated is not None
+        self.assertEqual(protocol.records[0].status, "repeated")
+        self.assertEqual(protocol.phase, "prepare")
+        self.assertEqual(protocol.records[1].requested_label_id, 1)
+        self.assertEqual(len(protocol.verified_records()), 0)
+
 
 class StorageTests(unittest.TestCase):
     def test_only_verified_windows_join_the_neat_dataset(self) -> None:
@@ -256,6 +299,10 @@ class StorageTests(unittest.TestCase):
             self.assertTrue((root / "normal" / "session" / "confusion.png").is_file())
             self.assertTrue((root / "normal" / "session" / "metrics.csv").is_file())
             self.assertTrue((root / "normal" / "session" / "events.csv").is_file())
+            self.assertTrue((root / "normal" / "session" / "attempts.csv").is_file())
+            report = json.loads((root / "normal" / "session" / "metrics.json").read_text(encoding="utf-8"))
+            self.assertIn("recognition_metrics", report)
+            self.assertIn("counter_metrics", report)
 
 
 if __name__ == "__main__":
