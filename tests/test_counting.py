@@ -217,6 +217,60 @@ class DetectorCycleTests(unittest.TestCase):
         )
         self.assertEqual(sum(len(result.events) for result in results), 1)
 
+    def test_hook_follow_through_is_not_split_into_more_punches(self) -> None:
+        classifier = HeuristicClassifier(profile_settings("play"))
+        positions = (
+            -0.30,
+            -0.30,
+            -0.45,
+            -0.65,
+            -0.88,
+            -1.08,
+            -1.08,
+            -0.92,
+            -0.72,
+            -0.52,
+            -0.34,
+            -0.30,
+            -0.30,
+        )
+        frames = [
+            _features(
+                index * 40,
+                left_x=position,
+                left_elbow=100.0,
+                left_extension=0.98,
+            )
+            for index, position in enumerate(positions)
+        ]
+
+        results = _feed(classifier, frames)
+
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [3],
+        )
+        completed_index = next(index for index, result in enumerate(results) if result.events)
+        self.assertTrue(
+            all(
+                result.candidate in (None, "MOVIMIENTO")
+                for result in results[:completed_index]
+            )
+        )
+
+    def test_same_arm_can_punch_again_after_two_guard_frames(self) -> None:
+        classifier = HeuristicClassifier(profile_settings("play"))
+        first = _hook_cycle(0, side="left")
+        guard = [_features(440), _features(480), _features(520)]
+        second = _hook_cycle(560, side="left")
+
+        results = _feed(classifier, first + guard + second)
+
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [3, 3],
+        )
+
 
 class TargetSingleHitTests(unittest.TestCase):
     def test_same_event_id_cannot_score_two_targets(self) -> None:

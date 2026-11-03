@@ -97,6 +97,7 @@ class _ArmDecision:
     classification_reason: str | None = None
     elbow: float | None = None
     peak_extension: float = 0.0
+    extension_gain: float = 0.0
     peak_lateral: float = 0.0
     event_id: str | None = None
 
@@ -135,6 +136,10 @@ class _ArmTracker:
         self.last_classification_reason: str | None = None
         self.event_id: str | None = None
         self.emitted = False
+        self.awaiting_rearm = False
+        self.rearm_streak = 0
+        self.rearm_extension_limit = 0.0
+        self.rearm_lateral_limit = 0.0
 
     def reset(self) -> None:
         self.__init__(self.side, self.settings)
@@ -157,6 +162,11 @@ class _ArmTracker:
 
         self.missing_frames = 0
         self._smooth(observation)
+        frame_gap_ms = (
+            None
+            if self.previous_ms is None
+            else timestamp_ms - self.previous_ms
+        )
         speed, extension_rate = self._rates(timestamp_ms)
         self.previous_ms = timestamp_ms
         self.previous_extension = self.smooth_extension
@@ -175,6 +185,31 @@ class _ArmTracker:
         lateral = abs(self.smooth_x - self.baseline_x)
         self.last_lateral = lateral
         extension_gain = self.smooth_extension - self.baseline_extension
+
+        # Un golpe confirmado al frenar todavía no ha terminado físicamente:
+        # el brazo sigue cruzando el encuadre o regresando. No abras un ciclo
+        # nuevo durante ese mismo recorrido. El brazo se rearma al quedar
+        # estable cerca de su base; un salto amplio de timestamp también
+        # delimita dos movimientos separados.
+        if self.awaiting_rearm:
+            near_release = (
+                abs(extension_gain) <= self.rearm_extension_limit
+                and lateral <= self.rearm_lateral_limit
+                and speed <= max(0.15, self.settings.min_wrist_speed * 2.5)
+            )
+            self.rearm_streak = self.rearm_streak + 1 if near_release else 0
+            resumed_after_gap = (
+                near_release
+                and frame_gap_ms is not None
+                and frame_gap_ms >= 120
+            )
+            if self.rearm_streak < 2 and not resumed_after_gap:
+                return self._pack(STATUS_RETURNING)
+            self.awaiting_rearm = False
+            self.rearm_streak = 0
+            self.phase = STATUS_NEUTRAL
+            self._snap_baseline()
+            return self._pack(STATUS_NEUTRAL)
 
         if self.phase == STATUS_NEUTRAL:
             started = self._movement_started(
@@ -261,7 +296,7 @@ class _ArmTracker:
             and not still_growing
         )
         if self.settings.allow_early_confirm and ready_to_close:
-            completed = self._complete_cycle(timestamp_ms)
+            completed = self._complete_cycle(timestamp_ms, await_rearm=True)
             if completed is not None:
                 return completed
 
@@ -278,7 +313,7 @@ class _ArmTracker:
             <= max(self.settings.return_lateral, 0.45 * self.peak_lateral)
         )
         if returned and elapsed >= self.settings.min_cycle_ms and not still_growing:
-            completed = self._complete_cycle(timestamp_ms)
+            completed = self._complete_cycle(timestamp_ms, await_rearm=False)
             if completed is not None:
                 return completed
             self.last_rejection = "tipo no distinguible"
@@ -359,7 +394,12 @@ class _ArmTracker:
         self.baseline_extension = self.smooth_extension
         self.baseline_x = self.smooth_x
 
-    def _complete_cycle(self, timestamp_ms: int) -> _ArmDecision | None:
+    def _complete_cycle(
+        self,
+        timestamp_ms: int,
+        *,
+        await_rearm: bool,
+    ) -> _ArmDecision | None:
         """Cierra el ciclo una sola vez, con la clase de toda la trayectoria."""
 
         if self.emitted:
@@ -371,13 +411,33 @@ class _ArmTracker:
         event = replace(event, ended_ms=timestamp_ms)
         self.emitted = True
         event_start_ms = self.started_ms
-        self._snap_baseline()
-        self._return_to_guard(timestamp_ms, cooldown=True)
+        event_extension_gain = max(0.0, self.peak_extension - self.frozen_extension)
+        event_peak_lateral = self.peak_lateral
+        if await_rearm:
+            self.rearm_extension_limit = max(
+                self.settings.start_extension * 1.5,
+                min(self.settings.return_margin, 0.25),
+                0.75 * event_extension_gain,
+            )
+            self.rearm_lateral_limit = max(
+                self.settings.lateral_start * 1.5,
+                min(self.settings.return_lateral, 0.25),
+                0.75 * self.peak_lateral,
+            )
+        else:
+            self._snap_baseline()
+        self._return_to_guard(
+            timestamp_ms,
+            cooldown=True,
+            await_rearm=await_rearm,
+        )
         return self._pack(
             STATUS_COMPLETED,
             event=event,
             event_start_ms=event_start_ms,
             event_end_ms=timestamp_ms,
+            event_extension_gain=event_extension_gain,
+            event_peak_lateral=event_peak_lateral,
         )
 
     def _pack(
@@ -390,11 +450,30 @@ class _ArmTracker:
         rejection: str | None = None,
         event_start_ms: int | None = None,
         event_end_ms: int | None = None,
+        event_extension_gain: float | None = None,
+        event_peak_lateral: float | None = None,
     ) -> _ArmDecision:
         candidate = None
         if event is None and phase not in (STATUS_NEUTRAL, STATUS_COMPLETED):
-            tentative = self._classify() if self.started_ms is not None else None
+            # La geometría intermedia de un gancho atraviesa posturas que
+            # parecen jab/cross. No muestres una clase hasta haber observado
+            # el pico y el regreso de la trayectoria completa.
+            tentative = (
+                self._classify()
+                if phase == STATUS_RETURNING and self.started_ms is not None
+                else None
+            )
             candidate = tentative.display_name if tentative is not None else "MOVIMIENTO"
+        extension_gain = (
+            max(0.0, self.peak_extension - self.frozen_extension)
+            if event_extension_gain is None
+            else event_extension_gain
+        )
+        peak_lateral = (
+            self.peak_lateral
+            if event_peak_lateral is None
+            else event_peak_lateral
+        )
         return _ArmDecision(
             phase,
             event=event,
@@ -411,12 +490,19 @@ class _ArmTracker:
             classification_reason=self.last_classification_reason,
             elbow=self.smooth_elbow,
             peak_extension=self.peak_extension,
-            peak_lateral=self.peak_lateral,
+            extension_gain=extension_gain,
+            peak_lateral=peak_lateral,
             event_id=self.event_id,
         )
 
-    def _return_to_guard(self, timestamp_ms: int, *, cooldown: bool = True) -> None:
-        self.phase = STATUS_NEUTRAL
+    def _return_to_guard(
+        self,
+        timestamp_ms: int,
+        *,
+        cooldown: bool = True,
+        await_rearm: bool = False,
+    ) -> None:
+        self.phase = STATUS_RETURNING if await_rearm else STATUS_NEUTRAL
         self.started_ms = None
         self.event_id = None
         self.emitted = False
@@ -426,6 +512,11 @@ class _ArmTracker:
         self.peak_elbow_gain = 0.0
         self.peak_lateral = 0.0
         self.peak_speed = 0.0
+        self.awaiting_rearm = await_rearm
+        self.rearm_streak = 0
+        if not await_rearm:
+            self.rearm_extension_limit = 0.0
+            self.rearm_lateral_limit = 0.0
         if cooldown:
             self.cooldown_until_ms = timestamp_ms + self.settings.cooldown_ms
 
@@ -980,7 +1071,9 @@ def _is_moving(left: _ArmDecision, right: _ArmDecision) -> bool:
 
 
 def _motion_mass(decision: _ArmDecision) -> float:
-    return max(0.0, decision.peak_extension) + max(0.0, decision.peak_lateral)
+    # Compara cuánto se movió cada brazo, no su distancia absoluta al hombro.
+    # La longitud aparente del brazo contrario no es evidencia de otro golpe.
+    return max(0.0, decision.extension_gain) + max(0.0, decision.peak_lateral)
 
 
 def _select_events(left: _ArmDecision, right: _ArmDecision) -> tuple[PunchEvent, ...]:
