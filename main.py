@@ -12,7 +12,7 @@ import time
 
 import cv2
 
-from app.camera import Camera, CameraError
+from app.camera import CameraError, CameraRig, probe_cameras
 from app.config import DEFAULT_DATA_DIR, PROJECT_ROOT, AppConfig, DEFAULT_MODEL_PATH
 from app.data_collector import DataCollector
 from app.dataset_manager import DatasetError, DatasetManager
@@ -26,6 +26,45 @@ from app.trainer.session import TrainingSession
 
 WINDOW_TITLE = "EvoBox AI — Pose Tracking"
 LIVE_WINDOW_TITLE = "EvoBox AI — Entrenador"
+
+
+def camera_for_config(config: AppConfig) -> CameraRig:
+    """Construye el rig a partir de la configuración común de todos los modos."""
+
+    return CameraRig(
+        front_index=config.camera_index,
+        left_index=config.camera_left_index,
+        right_index=config.camera_right_index,
+        depth_index=config.camera_depth_index,
+        setup=config.camera_setup,
+        max_scan_index=config.camera_max_scan_index,
+        width=config.frame_width,
+        height=config.frame_height,
+        probe_attempts=config.camera_probe_attempts,
+    )
+
+
+def print_camera_inventory(config: AppConfig) -> int:
+    """Imprime la disponibilidad real para elegir índices antes de arrancar."""
+
+    infos = probe_cameras(
+        max_index=config.camera_max_scan_index,
+        width=config.frame_width,
+        height=config.frame_height,
+        probe_attempts=min(2, config.camera_probe_attempts),
+    )
+    available = [info for info in infos if info.available]
+    if not available:
+        print("No se detectaron webcams que entreguen fotogramas.")
+        return 1
+    print("Webcams detectadas:")
+    for info in available:
+        size = f"{info.width}x{info.height}" if info.width and info.height else "resolución desconocida"
+        backend = info.backend or "backend desconocido"
+        print(f"  índice {info.index}: {size}, {backend}")
+    print("Ejemplos: --camera-setup triple --camera-left-index 1 --camera-right-index 2")
+    print("         --camera-setup depth --camera-depth-index 1 --depth-gate strict")
+    return 0
 
 
 class FrameRateMeter:
@@ -61,6 +100,50 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Índice de VideoCapture (predeterminado: 0).",
+    )
+    parser.add_argument(
+        "--camera-setup",
+        choices=("single", "stereo", "triple", "depth", "auto"),
+        default="single",
+        help=(
+            "single frontal; stereo frontal+izquierda; triple frontal+izquierda+derecha; "
+            "depth frontal+auxiliar de profundidad; auto asigna extras disponibles."
+        ),
+    )
+    parser.add_argument(
+        "--camera-left-index",
+        type=int,
+        help="Índice de la webcam que ocupará el rol izquierda.",
+    )
+    parser.add_argument(
+        "--camera-right-index",
+        type=int,
+        help="Índice de la webcam que ocupará el rol derecha.",
+    )
+    parser.add_argument(
+        "--camera-depth-index",
+        type=int,
+        help="Índice de la webcam auxiliar usada como señal de profundidad.",
+    )
+    parser.add_argument(
+        "--camera-max-scan-index",
+        type=int,
+        default=8,
+        help="Último índice que se prueba al autoasignar o listar cámaras.",
+    )
+    parser.add_argument(
+        "--depth-gate",
+        choices=("off", "soft", "strict"),
+        default="soft",
+        help=(
+            "Profundidad: off no la usa, soft solo registra evidencia, strict "
+            "rechaza un evento sin confirmación lateral."
+        ),
+    )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="Prueba índices de cámara disponibles y termina sin abrir el entrenador.",
     )
     parser.add_argument(
         "--width",
@@ -257,12 +340,7 @@ def run(config: AppConfig) -> None:
     config.validate()
     fps_meter = FrameRateMeter(config.fps_window_size)
 
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
 
     try:
         with PoseTracker(
@@ -303,12 +381,7 @@ def run_collection(config: AppConfig, args: argparse.Namespace | None = None) ->
     fps_meter = FrameRateMeter(config.fps_window_size)
     dataset = DatasetManager(config.data_dir)
     collector = DataCollector(config, dataset)
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
     print(f"Recopilación local en {config.data_dir}")
     print("Postura orthodox. Elige la clase con 0-4 y graba con Espacio.")
 
@@ -364,6 +437,7 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     from app.trainer.calibration import MotionCalibrator
     from app.trainer.diagnostics import DiagnosticLog
     from app.trainer.factory import create_classifier
+    from app.multiview import MultiViewMonitor
 
     sensitivity = args.sensitivity
     if sensitivity is None:
@@ -396,12 +470,8 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     diagnostics = DiagnosticLog()
     default_sensitivity = sensitivity
     fps_meter = FrameRateMeter(config.fps_window_size)
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
+    multiview = MultiViewMonitor(config)
     if classifier.name == "external":
         print("Entrenador en vivo con YOLO Pose y el LSTM preentrenado.")
         print("Las activaciones no se muestran como probabilidades calibradas.")
@@ -415,6 +485,16 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     print(f"Sensibilidad inicial: {sensitivity}.")
     print("1 normal, 2 alta, 3 máxima, 0 restaura, D diagnóstico, C calibración.")
     print("P pausa o reanuda, R reinicia y Q cierra. La sesión ya está contando.")
+    if config.camera_setup != "single":
+        print(
+            "Rig de cámaras: "
+            + ", ".join(
+                f"{role}={index}"
+                for role, index in camera.requested_indices.items()
+                if index is not None
+            )
+            + f" | depth gate={config.depth_gate}"
+        )
 
     try:
         with PoseTracker(
@@ -423,9 +503,19 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
             min_presence_confidence=config.min_pose_presence_confidence,
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
+            multiview.open(camera)
+            if len(camera.role_indices) > 1:
+                print(
+                    "Roles activos: "
+                    + ", ".join(
+                        f"{role}={index}" for role, index in camera.role_indices.items()
+                    )
+                )
             cv2.namedWindow(LIVE_WINDOW_TITLE, cv2.WINDOW_NORMAL)
             while True:
                 packet = camera.read()
+                if camera.last_frame is not None:
+                    multiview.observe(camera.last_frame, camera)
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
                 features = extract_biomechanical_features(
                     pose,
@@ -439,6 +529,7 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                     pose=pose,
                     frame=packet.frame,
                 )
+                result = multiview.filter_result(result, packet.timestamp_ms)
                 if calibrator.active and classifier.name == "heuristic":
                     calibrator.observe(packet.timestamp_ms, classifier.telemetry)
                     if calibrator.finished(packet.timestamp_ms):
@@ -503,6 +594,7 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                 if session.handle_key(key):
                     break
     finally:
+        multiview.close()
         close = getattr(classifier, "close", None)
         if close is not None:
             close()
@@ -670,6 +762,7 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
     from app.dataset_manager import DatasetManager
     from app.trainer.factory import create_classifier
     from app.trainer.capabilities import classifier_capabilities
+    from app.multiview import MultiViewMonitor
 
     sensitivity = args.sensitivity or "normal"
     classifier = create_classifier(
@@ -713,12 +806,8 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
     frames: list = []
     counter_audit = TrainingSession()
     fps_meter = FrameRateMeter(config.fps_window_size)
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
+    multiview = MultiViewMonitor(config)
     print("Evaluación guiada. La consigna no se toma como un acierto.")
     print("Y confirma, 0-4 corrige, R repite, X marca incorrecto/excluye y Q termina.")
     print(f"Sensibilidad {sensitivity}. Repeticiones por clase: {args.repetitions}.")
@@ -736,9 +825,12 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
             min_presence_confidence=config.min_pose_presence_confidence,
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
+            multiview.open(camera)
             cv2.namedWindow(LIVE_WINDOW_TITLE, cv2.WINDOW_NORMAL)
             while True:
                 packet = camera.read()
+                if camera.last_frame is not None:
+                    multiview.observe(camera.last_frame, camera)
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
                 features = extract_biomechanical_features(
                     pose,
@@ -761,6 +853,7 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
                     pose=pose,
                     frame=packet.frame,
                 )
+                result = multiview.filter_result(result, packet.timestamp_ms)
                 fps = fps_meter.tick()
                 if protocol.phase == "execute":
                     frames.append(
@@ -829,6 +922,7 @@ def run_benchmark(config: AppConfig, args: argparse.Namespace) -> int:
                 if protocol.finished:
                     break
     finally:
+        multiview.close()
         close = getattr(classifier, "close", None)
         if close is not None:
             close()
@@ -933,6 +1027,7 @@ def _draw_calibration_overlay(
 def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
     """Calibración individual real; guarda una propuesta, no la aplica."""
 
+    from app.multiview import MultiViewMonitor
     from app.trainer.calibration_session import CalibrationProtocol, save_calibration
     from app.trainer.factory import create_classifier
     from app.trainer.preflight import orientation_label, tracking_snapshot
@@ -952,12 +1047,8 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
     orientation = orientation_label(args.orientation)
     preflight_rows: list[dict[str, object]] = []
     fps_meter = FrameRateMeter(config.fps_window_size)
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
+    multiview = MultiViewMonitor(config)
     print("Calibración individual real del detector heurístico.")
     print("No modifica el clasificador ni crea muestras NEAT.")
     print("En preflight: F = frontal, A = 30–45°, ENTER inicia, Q sale.")
@@ -970,9 +1061,12 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
             min_presence_confidence=config.min_pose_presence_confidence,
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
+            multiview.open(camera)
             cv2.namedWindow(LIVE_WINDOW_TITLE, cv2.WINDOW_NORMAL)
             while True:
                 packet = camera.read()
+                if camera.last_frame is not None:
+                    multiview.observe(camera.last_frame, camera)
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
                 features = extract_biomechanical_features(
                     pose,
@@ -1000,6 +1094,7 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
                     pose=pose,
                     frame=packet.frame,
                 )
+                result = multiview.filter_result(result, packet.timestamp_ms)
                 if protocol.phase == "execute":
                     evidence = _benchmark_evidence(
                         config,
@@ -1037,6 +1132,7 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
                 if protocol.finished:
                     break
     finally:
+        multiview.close()
         camera.release()
         cv2.destroyAllWindows()
 
@@ -1069,6 +1165,7 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
     """Objetivos sobre la webcam. Las muestras quedan provisionales hasta la revisión."""
 
     from app.data_collector import build_frame_record
+    from app.multiview import MultiViewMonitor
     from app.pose_tracker import LandmarkId
     from app.targets.placement import (
         PointSmoother,
@@ -1117,12 +1214,8 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
     left_smoother = PointSmoother()
     right_smoother = PointSmoother()
     fps_meter = FrameRateMeter(config.fps_window_size)
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
+    multiview = MultiViewMonitor(config)
     print("Target Training. El detector heurístico solo propone eventos.")
     print("La etiqueta del objetivo no queda verificada hasta la revisión.")
     print("La puntuación del juego no es la precisión de NEAT.")
@@ -1149,6 +1242,7 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
             min_presence_confidence=config.min_pose_presence_confidence,
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
+            multiview.open(camera)
             cv2.namedWindow("EvoBox AI — Objetivos", cv2.WINDOW_NORMAL)
 
             def _on_click(event: int, x: int, y: int, _flags: int, _param: object) -> None:
@@ -1158,6 +1252,8 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
             cv2.setMouseCallback("EvoBox AI — Objetivos", _on_click)
             while True:
                 packet = camera.read()
+                if camera.last_frame is not None:
+                    multiview.observe(camera.last_frame, camera)
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
                 features = extract_biomechanical_features(
                     pose,
@@ -1171,6 +1267,7 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
                     pose=pose,
                     frame=packet.frame,
                 )
+                result = multiview.filter_result(result, packet.timestamp_ms)
                 left = pose.landmark(LandmarkId.LEFT_SHOULDER)
                 right = pose.landmark(LandmarkId.RIGHT_SHOULDER)
                 tracking = bool(
@@ -1252,6 +1349,7 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
                 if key >= 0 and session.handle_key(key, packet.timestamp_ms):
                     break
     finally:
+        multiview.close()
         camera.release()
         cv2.destroyAllWindows()
     counts = review.counts()
@@ -1367,6 +1465,20 @@ def _review_saved_targets(
 
 def main() -> int:
     args = parse_args()
+    inventory_config = AppConfig(
+        camera_index=args.camera_index,
+        camera_max_scan_index=args.camera_max_scan_index,
+        frame_width=args.width,
+        frame_height=args.height,
+        model_path=args.model.expanduser().resolve(),
+    )
+    if args.list_cameras:
+        try:
+            inventory_config.validate()
+            return print_camera_inventory(inventory_config)
+        except (CameraError, FileNotFoundError, ValueError, cv2.error) as error:
+            print(f"Error al detectar cámaras: {error}", file=sys.stderr)
+            return 1
     if args.mode == "train":
         from app.evolution.experiment import run_training
 
@@ -1386,6 +1498,12 @@ def main() -> int:
 
     config = AppConfig(
         camera_index=args.camera_index,
+        camera_setup=args.camera_setup,
+        camera_left_index=args.camera_left_index,
+        camera_right_index=args.camera_right_index,
+        camera_depth_index=args.camera_depth_index,
+        camera_max_scan_index=args.camera_max_scan_index,
+        depth_gate=args.depth_gate,
         frame_width=args.width,
         frame_height=args.height,
         mirror_view=not args.no_mirror,

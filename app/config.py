@@ -20,6 +20,12 @@ class AppConfig:
     """Parámetros ajustables de captura, seguimiento y visualización."""
 
     camera_index: int = 0
+    camera_setup: str = "single"
+    camera_left_index: int | None = None
+    camera_right_index: int | None = None
+    camera_depth_index: int | None = None
+    camera_max_scan_index: int = 8
+    depth_gate: str = "soft"
     frame_width: int = 640
     frame_height: int = 480
     mirror_view: bool = True
@@ -55,6 +61,38 @@ class AppConfig:
     def validate(self) -> None:
         if self.camera_index < 0:
             raise ValueError("El índice de cámara no puede ser negativo.")
+        if self.camera_setup not in {"single", "stereo", "triple", "depth", "auto"}:
+            raise ValueError(
+                "camera_setup debe ser single, stereo, triple, depth o auto."
+            )
+        if self.camera_max_scan_index < 0:
+            raise ValueError("El índice máximo de búsqueda no puede ser negativo.")
+        if self.depth_gate not in {"off", "soft", "strict"}:
+            raise ValueError("depth_gate debe ser off, soft o strict.")
+        if (
+            self.depth_gate == "strict"
+            and self.camera_depth_index is None
+            and self.camera_setup not in {"depth", "auto"}
+        ):
+            raise ValueError(
+                "depth_gate strict necesita camera_depth_index o camera_setup depth/auto."
+            )
+        indices = {
+            "frontal": self.camera_index,
+            "izquierda": self.camera_left_index,
+            "derecha": self.camera_right_index,
+            "profundidad": self.camera_depth_index,
+        }
+        selected = [index for index in indices.values() if index is not None]
+        if any(index < 0 for index in selected):
+            raise ValueError("Los índices de cámara no pueden ser negativos.")
+        if len(selected) != len(set(selected)):
+            raise ValueError("Cada rol de cámara debe usar un índice distinto.")
+        if self.camera_setup == "single" and len(selected) > 1:
+            raise ValueError("El setup single solo puede usar la cámara frontal.")
+        if self.camera_setup == "depth" and self.camera_depth_index is None:
+            # Puede resolverse automáticamente al abrir si hay una cámara extra.
+            pass
         if self.frame_width <= 0 or self.frame_height <= 0:
             raise ValueError("La resolución de cámara debe ser positiva.")
         if self.fps_window_size < 2:

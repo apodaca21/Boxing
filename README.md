@@ -60,6 +60,38 @@ Ambos modos aceptan `--camera-index`, `--width`, `--height`, `--no-mirror` y
 `--model`. La recopilación también acepta `--data-dir`; su valor predeterminado
 es `data/`.
 
+## Dos o tres webcams
+
+La cámara frontal sigue siendo la que alimenta el detector principal. Las
+webcams adicionales se asignan por índice y nunca se interpretan
+automáticamente como izquierda o derecha anatómica:
+
+```bash
+# Ver qué índices entregan fotogramas
+python main.py --list-cameras
+
+# Frontal + cámara a la izquierda + cámara a la derecha
+python main.py --mode live --camera-setup triple \
+  --camera-index 0 --camera-left-index 1 --camera-right-index 2
+
+# Frontal + una webcam lateral usada como señal auxiliar de profundidad
+python main.py --mode live --camera-setup depth \
+  --camera-index 0 --camera-depth-index 1 --depth-gate soft
+```
+
+`--camera-setup auto` busca índices disponibles y asigna el primer extra a
+`left` y el segundo a `right`; para una sola cámara auxiliar conviene usar
+`depth` y seleccionar el índice explícitamente. La vista `depth` es una webcam
+RGB auxiliar, no un sensor de profundidad: el programa usa el movimiento
+temporal lateral como evidencia. `soft` registra esa evidencia sin bloquear el
+conteo; `strict` exige confirmación de la vista depth y puede rechazar eventos
+ambiguos. Para obtener profundidad métrica real todavía hace falta calibrar
+posición, orientación y sincronización de las cámaras.
+
+La selección también aplica a `track`, `collect`, `benchmark`, `calibrate`,
+`targets` y `game`. Si una cámara auxiliar se desconecta, la sesión termina con
+un error explícito para no continuar contando con una configuración distinta.
+
 `--consent` confirma explícitamente la captura local. La persona elige la
 etiqueta y revisa visualmente el esqueleto en la ventana antes de continuar;
 solo se guardan muestras biomecánicas validadas, nunca imágenes, video ni audio.

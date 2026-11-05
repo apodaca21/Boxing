@@ -27,6 +27,30 @@ class FramePacket:
     height: int
 
 
+@dataclass(frozen=True, slots=True)
+class CameraInfo:
+    """Resultado de una prueba de cámara sin conservar el dispositivo abierto."""
+
+    index: int
+    available: bool
+    width: int | None = None
+    height: int | None = None
+    backend: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RigFrame:
+    """Fotogramas del frontal y de las cámaras auxiliares en un instante."""
+
+    primary: FramePacket
+    by_role: dict[str, FramePacket]
+
+    @property
+    def auxiliary(self) -> dict[str, FramePacket]:
+        return {role: packet for role, packet in self.by_role.items() if role != "front"}
+
+
 class Camera:
     """Gestiona VideoCapture y garantiza timestamps crecientes."""
 
@@ -150,6 +174,226 @@ class Camera:
         self.backend_name = None
 
     def __enter__(self) -> Camera:
+        self.open()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.release()
+
+
+def probe_cameras(
+    *,
+    max_index: int = 8,
+    width: int = 640,
+    height: int = 480,
+    probe_attempts: int = 2,
+) -> tuple[CameraInfo, ...]:
+    """Enumera cámaras que realmente entregan un fotograma.
+
+    Los índices de OpenCV no son nombres estables de hardware. Esta función es
+    deliberadamente una prueba corta: sirve para elegir roles en el arranque,
+    pero la selección final debe guardarse por índice en la configuración.
+    """
+
+    if max_index < 0:
+        raise ValueError("El índice máximo de búsqueda no puede ser negativo.")
+    found: list[CameraInfo] = []
+    for index in range(max_index + 1):
+        camera = Camera(
+            index=index,
+            width=width,
+            height=height,
+            probe_attempts=probe_attempts,
+        )
+        try:
+            camera.open()
+        except CameraError as error:
+            found.append(CameraInfo(index=index, available=False, error=str(error)))
+        else:
+            try:
+                packet = camera.read()
+            except CameraError as error:
+                found.append(CameraInfo(index=index, available=False, error=str(error)))
+            else:
+                found.append(
+                    CameraInfo(
+                        index=index,
+                        available=True,
+                        width=packet.width,
+                        height=packet.height,
+                        backend=camera.backend_name,
+                    )
+                )
+        finally:
+            camera.release()
+    return tuple(found)
+
+
+class CameraRig:
+    """Captura frontal y hasta tres vistas con una API compatible con Camera.
+
+    ``front`` siempre alimenta el detector actual. Las vistas ``left``,
+    ``right`` y ``depth`` se conservan en ``last_frame.auxiliary`` para que un
+    módulo de fusión pueda usarlas sin cambiar el contrato de los modos
+    existentes. Las cámaras auxiliares no se mezclan geométricamente de forma
+    automática: para eso hace falta calibración extrínseca real.
+    """
+
+    ROLES = ("front", "left", "right", "depth")
+
+    def __init__(
+        self,
+        *,
+        front_index: int = 0,
+        left_index: int | None = None,
+        right_index: int | None = None,
+        depth_index: int | None = None,
+        setup: str = "single",
+        max_scan_index: int = 8,
+        width: int = 640,
+        height: int = 480,
+        probe_attempts: int = 5,
+    ) -> None:
+        self.front_index = front_index
+        self.requested_indices = {
+            "front": front_index,
+            "left": left_index,
+            "right": right_index,
+            "depth": depth_index,
+        }
+        self.setup = setup
+        self.max_scan_index = max_scan_index
+        self.width = width
+        self.height = height
+        self.probe_attempts = probe_attempts
+        self._cameras: dict[str, Camera] = {}
+        self._last_frame: RigFrame | None = None
+        self._resolved_indices: dict[str, int] = {}
+
+    @property
+    def last_frame(self) -> RigFrame | None:
+        return self._last_frame
+
+    @property
+    def role_indices(self) -> dict[str, int]:
+        return dict(self._resolved_indices)
+
+    @property
+    def backend_name(self) -> str | None:
+        camera = self._cameras.get("front")
+        return None if camera is None else camera.backend_name
+
+    def _resolve_indices(self) -> dict[str, int]:
+        requested = {
+            role: index
+            for role, index in self.requested_indices.items()
+            if index is not None
+        }
+        if self.setup == "single":
+            return {"front": int(self.front_index)}
+
+        available = {
+            info.index
+            for info in probe_cameras(
+                max_index=self.max_scan_index,
+                width=self.width,
+                height=self.height,
+                probe_attempts=min(2, self.probe_attempts),
+            )
+            if info.available
+        }
+        available.discard(self.front_index)
+        used = set(requested.values())
+        candidates = sorted(available - used)
+
+        def choose(role: str) -> None:
+            if role in requested:
+                return
+            if candidates:
+                requested[role] = candidates.pop(0)
+
+        if self.setup in {"stereo", "triple", "auto"}:
+            choose("left")
+        if self.setup in {"triple", "auto"}:
+            choose("right")
+        if self.setup == "depth":
+            choose("depth")
+
+        if self.setup == "depth" and "depth" not in requested:
+            raise CameraError(
+                "El modo depth necesita una cámara auxiliar disponible. "
+                "Indícala con --camera-depth-index o conecta otra webcam."
+            )
+        if self.setup in {"stereo", "triple"}:
+            required = ("left",) if self.setup == "stereo" else ("left", "right")
+            missing = [role for role in required if role not in requested]
+            if missing:
+                raise CameraError(
+                    "No se pudieron asignar las cámaras "
+                    + ", ".join(missing)
+                    + ". Usa --camera-left-index/--camera-right-index."
+                )
+
+        resolved = {"front": int(self.front_index)}
+        resolved.update({role: int(index) for role, index in requested.items() if role != "front"})
+        if len(set(resolved.values())) != len(resolved):
+            raise CameraError("Cada rol de cámara debe usar un índice distinto.")
+        return resolved
+
+    def open(self) -> None:
+        self.release()
+        self._resolved_indices = self._resolve_indices()
+        failures: list[str] = []
+        opened: dict[str, Camera] = {}
+        try:
+            for role, index in self._resolved_indices.items():
+                camera = Camera(
+                    index=index,
+                    width=self.width,
+                    height=self.height,
+                    probe_attempts=self.probe_attempts,
+                )
+                try:
+                    camera.open()
+                except CameraError as error:
+                    failures.append(f"{role}={index}: {error}")
+                    camera.release()
+                    continue
+                opened[role] = camera
+            if "front" not in opened:
+                raise CameraError("La cámara frontal no pudo abrirse.")
+            if failures:
+                raise CameraError("No se pudieron abrir todas las cámaras: " + "; ".join(failures))
+            self._cameras = opened
+            self._last_frame = None
+        except Exception:
+            for camera in opened.values():
+                camera.release()
+            self._cameras.clear()
+            raise
+
+    def read(self) -> FramePacket:
+        """Lee el frontal y actualiza las auxiliares; devuelve el frontal."""
+
+        if not self._cameras:
+            raise CameraError("El rig de cámaras no está abierto.")
+        packets = {role: camera.read() for role, camera in self._cameras.items()}
+        primary = packets["front"]
+        self._last_frame = RigFrame(primary=primary, by_role=packets)
+        return primary
+
+    def read_rig(self) -> RigFrame:
+        self.read()
+        assert self._last_frame is not None
+        return self._last_frame
+
+    def release(self) -> None:
+        for camera in self._cameras.values():
+            camera.release()
+        self._cameras.clear()
+        self._last_frame = None
+
+    def __enter__(self) -> CameraRig:
         self.open()
         return self
 

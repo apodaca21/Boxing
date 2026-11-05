@@ -6,18 +6,19 @@ import argparse
 
 import cv2
 
-from app.camera import Camera
+from app.camera import CameraRig
 from app.config import AppConfig
 from app.game.challenge import TargetChallenge
 from app.game.draw import draw_challenge, draw_free, draw_menu, shown_point, target_screen
 from app.game.free_round import FreeRound
 from app.game.store import latest_rounds, save_round
 from app.geometry import extract_biomechanical_features
+from app.multiview import MultiViewMonitor
 from app.overlay import render_frame
 from app.pose_tracker import LandmarkId, PoseTracker
 from app.targets.placement import PointSmoother, body_offset
 from app.trainer.factory import create_classifier
-from main import FrameRateMeter
+from main import FrameRateMeter, camera_for_config
 
 
 GAME_WINDOW = "EvoBox AI"
@@ -50,12 +51,8 @@ def run_game(config: AppConfig, args: argparse.Namespace) -> int:
         results_dir=args.results_dir,
         sensitivity=sensitivity,
     )
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
+    multiview = MultiViewMonitor(config)
     fps_meter = FrameRateMeter(config.fps_window_size)
     try:
         with PoseTracker(
@@ -64,6 +61,7 @@ def run_game(config: AppConfig, args: argparse.Namespace) -> int:
             min_presence_confidence=config.min_pose_presence_confidence,
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
+            multiview.open(camera)
             _open_window(config.frame_width, config.frame_height)
             print(f"Juego {args.game_mode}. Clasificador activo: {classifier.name}.")
             if classifier.name == "neat":
@@ -77,17 +75,18 @@ def run_game(config: AppConfig, args: argparse.Namespace) -> int:
             duration_ms = int(args.round_seconds * 1000)
             if args.game_mode == "free":
                 game: FreeRound | TargetChallenge = FreeRound(classifier.name, duration_ms=duration_ms)
-                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game)
+                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game, multiview)
             if args.game_mode == "targets":
                 game = TargetChallenge(
                     classifier.name,
                     difficulty=args.difficulty,
                     duration_ms=duration_ms,
                 )
-                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game)
+                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game, multiview)
             print("El modo de juego debe ser free o targets.")
             return 2
     finally:
+        multiview.close()
         close = getattr(classifier, "close", None)
         if close is not None:
             close()
@@ -117,12 +116,7 @@ def _show(frame: object, width: int, height: int) -> None:
 
 
 def _menu_session(config: AppConfig, args: argparse.Namespace) -> str | None:
-    camera = Camera(
-        index=config.camera_index,
-        width=config.frame_width,
-        height=config.frame_height,
-        probe_attempts=config.camera_probe_attempts,
-    )
+    camera = camera_for_config(config)
     fps_meter = FrameRateMeter(config.fps_window_size)
     show_stats = False
     choice: str | None = None
@@ -183,16 +177,19 @@ def _play_loop(
     config: AppConfig,
     args: argparse.Namespace,
     classifier: object,
-    camera: Camera,
+    camera: CameraRig,
     tracker: PoseTracker,
     fps_meter: FrameRateMeter,
     game: FreeRound | TargetChallenge,
+    multiview: MultiViewMonitor,
 ) -> int:
     left_smoother = PointSmoother()
     right_smoother = PointSmoother()
     saved = False
     while True:
         packet = camera.read()
+        if camera.last_frame is not None:
+            multiview.observe(camera.last_frame, camera)
         pose = tracker.detect(packet.frame, packet.timestamp_ms)
         features = extract_biomechanical_features(
             pose,
@@ -206,6 +203,7 @@ def _play_loop(
             pose=pose,
             frame=packet.frame,
         )
+        result = multiview.filter_result(result, packet.timestamp_ms)
         fps = fps_meter.tick()
         display = render_frame(packet.frame, pose, features, fps, config, overlay=False)
         tracking = _tracking(pose)
