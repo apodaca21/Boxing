@@ -47,24 +47,78 @@ def camera_for_config(config: AppConfig) -> CameraRig:
 def print_camera_inventory(config: AppConfig) -> int:
     """Imprime la disponibilidad real para elegir índices antes de arrancar."""
 
-    infos = probe_cameras(
+    from app.camera_identity import inventory, suggest_depth_pair
+
+    rows = inventory(
         max_index=config.camera_max_scan_index,
         width=config.frame_width,
         height=config.frame_height,
         probe_attempts=min(2, config.camera_probe_attempts),
     )
-    available = [info for info in infos if info.available]
+    available = [row for row in rows if row.available]
     if not available:
         print("No se detectaron webcams que entreguen fotogramas.")
         return 1
     print("Webcams detectadas:")
-    for info in available:
-        size = f"{info.width}x{info.height}" if info.width and info.height else "resolución desconocida"
-        backend = info.backend or "backend desconocido"
-        print(f"  índice {info.index}: {size}, {backend}")
+    for row in rows:
+        if not row.available:
+            continue
+        size = f"{row.width}x{row.height}" if row.width and row.height else "resolución desconocida"
+        backend = row.backend or "backend desconocido"
+        brightness = "--" if row.mean_brightness is None else f"{row.mean_brightness:.0f}"
+        print(f"  índice {row.index}: {row.name} | {size}, {backend}, brillo {brightness}")
+    pair = suggest_depth_pair(rows)
+    if pair is not None:
+        print(
+            "Sugerencia depth: "
+            f"--camera-index {pair.front_index} --camera-depth-index {pair.depth_index}"
+            f"  ({pair.front_name} + {pair.depth_name})"
+        )
+        for note in pair.notes:
+            print(f"  nota: {note}")
     print("Ejemplos: --camera-setup triple --camera-left-index 1 --camera-right-index 2")
-    print("         --camera-setup depth --camera-depth-index 1 --depth-gate strict")
+    print("         --camera-setup depth --camera-depth-index 1 --depth-gate soft")
     return 0
+
+
+def resolve_depth_config(config: AppConfig, args: argparse.Namespace) -> AppConfig:
+    """Asigna laptop=frontal y USB=profundidad cuando el modo depth no trae índices claros."""
+
+    if config.camera_setup != "depth":
+        return config
+    explicit_depth = args.camera_depth_index is not None
+    explicit_front = any(
+        flag in sys.argv
+        for flag in ("--camera-index", "-camera-index")
+    )
+    if explicit_depth and explicit_front:
+        return config
+    from app.camera_identity import inventory, suggest_depth_pair
+
+    rows = inventory(
+        max_index=config.camera_max_scan_index,
+        width=config.frame_width,
+        height=config.frame_height,
+        probe_attempts=min(2, config.camera_probe_attempts),
+    )
+    pair = suggest_depth_pair(
+        rows,
+        preferred_front=None if not explicit_front else config.camera_index,
+        preferred_depth=None if not explicit_depth else config.camera_depth_index,
+    )
+    if pair is None:
+        return config
+    print(
+        f"Asignación depth: frontal={pair.front_index} ({pair.front_name}) | "
+        f"profundidad={pair.depth_index} ({pair.depth_name})"
+    )
+    for note in pair.notes:
+        print(f"  nota: {note}")
+    return replace(
+        config,
+        camera_index=pair.front_index if not explicit_front else config.camera_index,
+        camera_depth_index=pair.depth_index if not explicit_depth else config.camera_depth_index,
+    )
 
 
 class FrameRateMeter:
@@ -136,8 +190,8 @@ def parse_args() -> argparse.Namespace:
         choices=("off", "soft", "strict"),
         default="soft",
         help=(
-            "Profundidad: off no la usa, soft solo registra evidencia, strict "
-            "rechaza un evento sin confirmación lateral."
+            "Profundidad: off no la usa; soft corrige jab/gancho con la webcam "
+            "lateral; strict además exige confirmación para contar."
         ),
     )
     parser.add_argument(
@@ -460,6 +514,7 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     tune = getattr(classifier, "set_sensitivity", None)
     if tune is not None and classifier.name != "heuristic":
         tune(sensitivity)
+    config = resolve_depth_config(config, args)
     config.validate()
     session = TrainingSession()
     session.source = classifier.name
@@ -511,11 +566,18 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                         f"{role}={index}" for role, index in camera.role_indices.items()
                     )
                 )
+                print("F intercambia frontal y profundidad. La miniatura DEPTH debe verse al lado.")
+            session.camera_line = multiview.role_line or ", ".join(
+                f"{role}={index}" for role, index in camera.role_indices.items()
+            )
             cv2.namedWindow(LIVE_WINDOW_TITLE, cv2.WINDOW_NORMAL)
             while True:
                 packet = camera.read()
                 if camera.last_frame is not None:
                     multiview.observe(camera.last_frame, camera)
+                session.depth_status = multiview.status_line
+                session.depth_ready = multiview.readiness.ready
+                session.camera_line = multiview.role_line or session.camera_line
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
                 features = extract_biomechanical_features(
                     pose,
@@ -563,6 +625,7 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                             "latency_ms": None if result.latency_ms is None else round(result.latency_ms, 2),
                             "fps": None if fps is None else round(fps, 2),
                             "contains_video": False,
+                            "depth_status": session.depth_status,
                         }
                     )
                 display = render_frame(
@@ -572,6 +635,7 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                     fps,
                     config,
                     live=session.view(packet.timestamp_ms),
+                    aux_frame=multiview.preview_bgr,
                 )
                 cv2.imshow(LIVE_WINDOW_TITLE, display)
                 key = cv2.waitKey(1) & 0xFF
@@ -591,6 +655,23 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                         print("Calibración de 14 s. Los golpes de esta rutina no se guardan para NEAT.")
                     else:
                         print("La calibración de umbrales aplica al detector heurístico.")
+                elif key in (ord("f"), ord("F")) and config.camera_setup == "depth":
+                    try:
+                        new_front, new_depth = camera.swap_front_depth()
+                    except CameraError as error:
+                        print(f"No se pudo intercambiar: {error}")
+                    else:
+                        print(f"Intercambiando cámaras: frontal {new_front}, depth {new_depth}")
+                        config = replace(
+                            config,
+                            camera_index=new_front,
+                            camera_depth_index=new_depth,
+                        )
+                        multiview.close()
+                        multiview = MultiViewMonitor(config)
+                        multiview.open(camera)
+                        session.camera_line = multiview.role_line
+                        classifier.reset()
                 if session.handle_key(key):
                     break
     finally:

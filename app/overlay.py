@@ -556,9 +556,12 @@ def _draw_live(
         1,
         cv2.LINE_AA,
     )
+    controls = "1-3 sens  D debug  C calibra"
+    if view.camera_line:
+        controls = "F intercambia  " + controls
     cv2.putText(
         image,
-        "1-3 sens  D debug  C calibra",
+        controls,
         (16, height - 16),
         body_font,
         0.40,
@@ -566,6 +569,31 @@ def _draw_live(
         1,
         cv2.LINE_AA,
     )
+    if view.depth_status or view.camera_line:
+        depth_y = summary_y + len(summary) * 20 + 8
+        if view.camera_line:
+            cv2.putText(
+                image,
+                _opencv_text(view.camera_line)[:34],
+                (16, depth_y),
+                body_font,
+                0.36,
+                (180, 190, 205),
+                1,
+                cv2.LINE_AA,
+            )
+            depth_y += 18
+        if view.depth_status:
+            cv2.putText(
+                image,
+                _opencv_text(view.depth_status)[:34],
+                (16, depth_y),
+                body_font,
+                0.36,
+                (80, 220, 120) if "OK" in view.depth_status else (70, 175, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     if view.moving:
         cv2.circle(image, (panel_width + 18, 28), 7, (40, 180, 255), -1, cv2.LINE_AA)
@@ -774,6 +802,58 @@ def _draw_next_technique(image: NDArray[np.uint8], view: TargetView) -> None:
     cv2.putText(image, action, (width // 2 - 190, height // 2 + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (245, 248, 252), 2, cv2.LINE_AA)
 
 
+def _draw_depth_pip(
+    image: NDArray[np.uint8],
+    aux_bgr: NDArray[np.uint8],
+    *,
+    mirror: bool,
+    ready: bool = False,
+) -> None:
+    """Miniatura de la webcam de profundidad sobre la esquina de la frontal."""
+
+    height, width = image.shape[:2]
+    pip_w = max(120, width // 4)
+    pip_h = max(90, height // 4)
+    preview = cv2.resize(aux_bgr, (pip_w, pip_h), interpolation=cv2.INTER_AREA)
+    if mirror:
+        preview = cv2.flip(preview, 1)
+    x0 = width - pip_w - 12
+    y0 = height - pip_h - 12
+    image[y0 : y0 + pip_h, x0 : x0 + pip_w] = preview
+    accent = (70, 235, 110) if ready else (70, 175, 255)
+    if ready:
+        # Resplandor sutil para que el estado listo sea visible sin tapar la vista.
+        glow = image.copy()
+        for thickness, alpha in ((12, 0.10), (7, 0.16), (3, 0.24)):
+            cv2.rectangle(
+                glow,
+                (x0 - thickness // 2, y0 - thickness // 2),
+                (x0 + pip_w - 1 + thickness // 2, y0 + pip_h - 1 + thickness // 2),
+                accent,
+                thickness,
+                cv2.LINE_AA,
+            )
+            cv2.addWeighted(glow, alpha, image, 1.0 - alpha, 0.0, dst=image)
+    cv2.rectangle(image, (x0, y0), (x0 + pip_w - 1, y0 + pip_h - 1), accent, 3 if ready else 2, cv2.LINE_AA)
+    cv2.rectangle(image, (x0, y0 - 22), (x0 + pip_w - 1, y0), (12, 14, 18), -1)
+    cv2.putText(
+        image,
+        "DEPTH  LISTA" if ready else "DEPTH  AJUSTAR",
+        (x0 + 8, y0 - 6),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        accent,
+        1,
+        cv2.LINE_AA,
+    )
+    indicator_center = (x0 + pip_w - 15, y0 + 15)
+    if ready:
+        cv2.circle(image, indicator_center, 9, (235, 255, 240), -1, cv2.LINE_AA)
+        cv2.circle(image, indicator_center, 7, accent, -1, cv2.LINE_AA)
+    else:
+        cv2.circle(image, indicator_center, 6, accent, -1, cv2.LINE_AA)
+
+
 def render_frame(
     frame_bgr: NDArray[np.uint8],
     pose: PoseObservation,
@@ -785,6 +865,7 @@ def render_frame(
     benchmark: BenchmarkView | None = None,
     targets: TargetView | None = None,
     overlay: bool = True,
+    aux_frame: NDArray[np.uint8] | None = None,
 ) -> NDArray[np.uint8]:
     """Devuelve una vista anotada sin modificar el fotograma de captura."""
 
@@ -808,4 +889,11 @@ def render_frame(
         _draw_collection(output, collection, config)
     if benchmark is not None:
         _draw_benchmark(output, benchmark, config)
+    if aux_frame is not None and live is not None:
+        _draw_depth_pip(
+            output,
+            aux_frame,
+            mirror=config.mirror_view,
+            ready=live.depth_ready,
+        )
     return output

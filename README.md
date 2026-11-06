@@ -81,12 +81,21 @@ python main.py --mode live --camera-setup depth \
 
 `--camera-setup auto` busca índices disponibles y asigna el primer extra a
 `left` y el segundo a `right`; para una sola cámara auxiliar conviene usar
-`depth` y seleccionar el índice explícitamente. La vista `depth` es una webcam
-RGB auxiliar, no un sensor de profundidad: el programa usa el movimiento
-temporal lateral como evidencia. `soft` registra esa evidencia sin bloquear el
-conteo; `strict` exige confirmación de la vista depth y puede rechazar eventos
-ambiguos. Para obtener profundidad métrica real todavía hace falta calibrar
-posición, orientación y sincronización de las cámaras.
+`depth`. Si no pasas índices, el programa intenta poner la laptop como frontal
+y la USB (p. ej. Steren) como profundidad. La vista `depth` es una webcam RGB
+auxiliar, no un sensor de profundidad: usa alcance y desplazamiento lateral
+para apoyar jab/cross frente a gancho. `soft` puede corregir la clase; `strict`
+además exige confirmación para contar. En vivo verás una miniatura DEPTH y
+puedes pulsar `F` para intercambiar frontal y profundidad. La miniatura muestra
+una luz y un borde verdes con brillo cuando la cámara entrega fotogramas, la
+imagen tiene nitidez y exposición razonables, la persona y los brazos están
+detectados, y el encuadre permanece estable durante unos instantes. Mientras
+se ajusta, indica si falta señal, enfoque, luz, brazos o estabilidad. Esta
+comprobación solo calcula métricas en memoria; no guarda imágenes. Para
+profundidad métrica real todavía hace falta calibrar posición, orientación y
+sincronización. La vista `depth` también ejecuta un detector biomecánico de
+respaldo: si la frontal pierde un golpe pero la secundaria completa el ciclo,
+se cuenta; si ambas lo ven, se deduplica para no sumar dos veces.
 
 La selección también aplica a `track`, `collect`, `benchmark`, `calibrate`,
 `targets` y `game`. Si una cámara auxiliar se desconecta, la sesión termina con

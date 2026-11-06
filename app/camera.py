@@ -393,6 +393,23 @@ class CameraRig:
         self._cameras.clear()
         self._last_frame = None
 
+    def swap_front_depth(self) -> tuple[int, int]:
+        """Intercambia los índices frontal y depth, reabriendo el rig."""
+
+        front = self._resolved_indices.get("front", self.front_index)
+        depth = self._resolved_indices.get("depth", self.requested_indices.get("depth"))
+        if depth is None:
+            raise CameraError("No hay cámara depth para intercambiar.")
+        self.front_index = depth
+        self.requested_indices = {
+            **self.requested_indices,
+            "front": depth,
+            "depth": front,
+        }
+        self.setup = "depth"
+        self.open()
+        return depth, front
+
     def __enter__(self) -> CameraRig:
         self.open()
         return self

@@ -36,6 +36,9 @@ class LiveView:
     debug_lines: tuple[str, ...] = ()
     training_style: str = "libre"
     rejection: str | None = None
+    camera_line: str = ""
+    depth_status: str = ""
+    depth_ready: bool = False
 
 
 class TrainingSession:
@@ -63,6 +66,9 @@ class TrainingSession:
         self.debug_lines: tuple[str, ...] = ()
         self.training_style = "libre"
         self.rejection: str | None = None
+        self.camera_line = ""
+        self.depth_status = ""
+        self.depth_ready = False
 
     def reset(self) -> None:
         self.running = True
@@ -80,6 +86,8 @@ class TrainingSession:
         self.moving = False
         self.rejection = None
         self.debug_lines = ()
+        # camera_line y depth_status se mantienen: describen el rig, no el conteo.
+        # depth_ready también describe el rig y no cambia al reiniciar el contador.
 
     def handle_key(self, key: int) -> bool:
         if key in (ord("q"), ord("Q"), 27):
@@ -157,6 +165,9 @@ class TrainingSession:
             debug_lines=self.debug_lines,
             training_style=self.training_style,
             rejection=self.rejection,
+            camera_line=self.camera_line,
+            depth_status=self.depth_status,
+            depth_ready=self.depth_ready,
         )
 
     def _rows(self) -> tuple[tuple[str, int, str], ...]:
