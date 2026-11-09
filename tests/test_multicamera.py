@@ -185,7 +185,102 @@ class DepthAssistTests(unittest.TestCase):
         fused = monitor.filter_result(front, 220)
         self.assertEqual(len(fused.events), 1)
         self.assertEqual(fused.events[0].event_id, "front:left:210")
+        self.assertEqual(fused.events[0].label_id, 3)
+        self.assertEqual(fused.events[0].display_name, "Gancho izquierdo")
+        self.assertEqual(fused.diagnostics.get("depth_fusion"), "depth_preferred")
+
+    def test_same_label_from_both_cameras_is_not_duplicated(self) -> None:
+        monitor = MultiViewMonitor(
+            AppConfig(camera_setup="depth", camera_depth_index=1, depth_gate="soft")
+        )
+        monitor._depth_result = ClassificationResult(
+            source="heuristic",
+            status="completado",
+            label_id=1,
+            display_name="Jab izquierdo",
+            events=(
+                PunchEvent(1, "Jab izquierdo", "left", event_id="depth:left:220", ended_ms=220),
+            ),
+            active_arm="left",
+        )
+        front = ClassificationResult(
+            source="heuristic",
+            status="completado",
+            label_id=1,
+            display_name="Jab izquierdo",
+            events=(
+                PunchEvent(1, "Jab izquierdo", "left", event_id="front:left:210", ended_ms=210),
+            ),
+            active_arm="left",
+        )
+        fused = monitor.filter_result(front, 220)
+        self.assertEqual(len(fused.events), 1)
+        self.assertEqual(fused.events[0].event_id, "front:left:210")
         self.assertEqual(fused.diagnostics.get("depth_fusion"), "same_event")
+
+    def test_late_front_event_does_not_double_count_depth_punch(self) -> None:
+        monitor = MultiViewMonitor(
+            AppConfig(camera_setup="depth", camera_depth_index=1, depth_gate="soft")
+        )
+        monitor._depth_result = ClassificationResult(
+            source="heuristic",
+            status="completado",
+            label_id=4,
+            display_name="Gancho derecho",
+            events=(
+                PunchEvent(4, "Gancho derecho", "right", event_id="depth:right:100", ended_ms=100),
+            ),
+            active_arm="right",
+        )
+        empty_front = ClassificationResult(
+            source="heuristic",
+            status="neutral",
+            label_id=0,
+            display_name="Guardia / Neutral",
+        )
+        first = monitor.filter_result(empty_front, 100)
+        self.assertEqual(len(first.events), 1)
+        self.assertEqual(first.events[0].source, "depth")
+
+        monitor._depth_result = ClassificationResult(
+            source="heuristic",
+            status="neutral",
+            label_id=0,
+            display_name="Guardia / Neutral",
+        )
+        late_front = ClassificationResult(
+            source="heuristic",
+            status="completado",
+            label_id=2,
+            display_name="Cross derecho",
+            events=(
+                PunchEvent(2, "Cross derecho", "right", event_id="front:right:280", ended_ms=280),
+            ),
+            active_arm="right",
+        )
+        second = monitor.filter_result(late_front, 280)
+        self.assertEqual(len(second.events), 0)
+        self.assertEqual(second.diagnostics.get("depth_fusion"), "suppressed_duplicate")
+
+    def test_depth_stays_ready_while_punching_moves_the_shoulders(self) -> None:
+        monitor = MultiViewMonitor(
+            AppConfig(camera_setup="depth", camera_depth_index=1)
+        )
+        pattern = np.indices((120, 160)).sum(axis=0).astype(np.uint8) * 127
+        frame = np.repeat(pattern[:, :, None], 3, axis=2)
+        packet = FramePacket(frame, 0, 0, 160, 120)
+        pose = self._good_depth_pose()
+        for _ in range(8):
+            readiness = monitor._depth_readiness(packet, pose)
+        self.assertTrue(readiness.ready)
+
+        slots = list(pose.landmarks)
+        slots[int(LandmarkId.LEFT_SHOULDER)] = LandmarkObservation(0.28, 0.42, 0.0, 1.0, 1.0)
+        slots[int(LandmarkId.RIGHT_SHOULDER)] = LandmarkObservation(0.72, 0.30, 0.0, 1.0, 1.0)
+        moving = PoseObservation(40, tuple(slots), tuple(slots))
+        readiness = monitor._depth_readiness(packet, moving)
+        self.assertTrue(readiness.ready)
+        self.assertIn("DEPTH LISTA", readiness.status)
 
     def test_soft_gate_relabels_false_jab_into_hook(self) -> None:
         config = AppConfig(camera_setup="depth", camera_depth_index=1, depth_gate="soft")

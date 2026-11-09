@@ -590,7 +590,7 @@ def _draw_live(
                 (16, depth_y),
                 body_font,
                 0.36,
-                (80, 220, 120) if "OK" in view.depth_status else (70, 175, 255),
+                (80, 220, 120) if view.depth_ready else (70, 175, 255),
                 1,
                 cv2.LINE_AA,
             )

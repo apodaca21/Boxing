@@ -526,7 +526,7 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     default_sensitivity = sensitivity
     fps_meter = FrameRateMeter(config.fps_window_size)
     camera = camera_for_config(config)
-    multiview = MultiViewMonitor(config)
+    multiview = MultiViewMonitor(config, depth_sensitivity=sensitivity)
     if classifier.name == "external":
         print("Entrenador en vivo con YOLO Pose y el LSTM preentrenado.")
         print("Las activaciones no se muestran como probabilidades calibradas.")
@@ -626,6 +626,12 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                             "fps": None if fps is None else round(fps, 2),
                             "contains_video": False,
                             "depth_status": session.depth_status,
+                            "depth_ready": session.depth_ready,
+                            "depth_fusion": result.diagnostics.get("depth_fusion"),
+                            "depth_assist": result.diagnostics.get("depth_assist"),
+                            "depth_gate": result.diagnostics.get("depth_gate"),
+                            "event_sources": [event.source for event in result.events],
+                            "event_labels": [event.label_id for event in result.events],
                         }
                     )
                 display = render_frame(
@@ -646,7 +652,9 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                         print("Este clasificador no tiene perfiles de sensibilidad.")
                     else:
                         tuner(chosen)
+                        sensitivity = chosen
                         session.sensitivity = chosen.upper()
+                        multiview.set_sensitivity(chosen)
                 elif key in (ord("d"), ord("D")):
                     session.debug = not session.debug
                 elif key in (ord("c"), ord("C")):
@@ -668,7 +676,10 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                             camera_depth_index=new_depth,
                         )
                         multiview.close()
-                        multiview = MultiViewMonitor(config)
+                        multiview = MultiViewMonitor(
+                            config,
+                            depth_sensitivity=sensitivity,
+                        )
                         multiview.open(camera)
                         session.camera_line = multiview.role_line
                         classifier.reset()

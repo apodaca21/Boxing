@@ -12,7 +12,7 @@ from app.camera import CameraRig, RigFrame
 from app.config import AppConfig
 from app.dataset_manager import MOVEMENTS
 from app.geometry import extract_biomechanical_features
-from app.pose_tracker import LandmarkId, PoseObservation, PoseTracker
+from app.pose_tracker import LandmarkId, LandmarkObservation, PoseObservation, PoseTracker
 from app.trainer.heuristic import HeuristicClassifier
 from app.trainer.results import STATUS_COMPLETED, ClassificationResult, PunchEvent
 from app.trainer.sensitivity import profile_settings
@@ -31,6 +31,7 @@ class DepthSignals:
     lateral: float
     reach: float
     age_ms: int
+    approach: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +51,9 @@ class DepthReadiness:
 DEPTH_MIN_SHARPNESS = 45.0
 DEPTH_MIN_ARM_QUALITY = 0.75
 DEPTH_REQUIRED_STABLE_FRAMES = 8
-DEPTH_EVENT_DEDUPE_MS = 350
+DEPTH_EVENT_DEDUPE_MS = 400
+DEPTH_HOLD_SHARPNESS = 25.0
+DEPTH_HOLD_ARM_QUALITY = 0.50
 
 
 def _focus_measure(frame: NDArray[np.uint8]) -> float:
@@ -91,6 +94,26 @@ def _arm_quality(pose: PoseObservation) -> float:
     return reliable / len(required)
 
 
+def _arm_depth_offset(
+    pose: PoseObservation,
+    shoulder_id: LandmarkId,
+    wrist_id: LandmarkId,
+    shoulder: LandmarkObservation,
+    wrist: LandmarkObservation,
+) -> float:
+    """Usa z de world landmarks si existen; si no, el z de la imagen."""
+
+    world = pose.world_landmarks
+    index_s = int(shoulder_id)
+    index_w = int(wrist_id)
+    if world and index_s < len(world) and index_w < len(world):
+        world_s = world[index_s]
+        world_w = world[index_w]
+        if world_s.is_finite and world_w.is_finite:
+            return world_w.z - world_s.z
+    return wrist.z - shoulder.z
+
+
 class _DepthMotionCue:
     """Señal temporal de una webcam lateral que apoya a la frontal.
 
@@ -102,9 +125,10 @@ class _DepthMotionCue:
     def __init__(self) -> None:
         self._baseline_x: dict[str, float | None] = {"left": None, "right": None}
         self._baseline_reach: dict[str, float | None] = {"left": None, "right": None}
-        self._signal: dict[str, tuple[int, float, float]] = {
-            "left": (-1, 0.0, 0.0),
-            "right": (-1, 0.0, 0.0),
+        self._baseline_z: dict[str, float | None] = {"left": None, "right": None}
+        self._signal: dict[str, tuple[int, float, float, float]] = {
+            "left": (-1, 0.0, 0.0, 0.0),
+            "right": (-1, 0.0, 0.0, 0.0),
         }
 
     def observe(self, timestamp_ms: int, pose: PoseObservation) -> None:
@@ -125,50 +149,66 @@ class _DepthMotionCue:
                 continue
             relative_x = wrist.x - shoulder.x
             reach = float(np.hypot(wrist.x - shoulder.x, wrist.y - shoulder.y))
+            relative_z = _arm_depth_offset(pose, shoulder_id, wrist_id, shoulder, wrist)
             baseline_x = self._baseline_x[arm]
             baseline_reach = self._baseline_reach[arm]
-            if baseline_x is None or baseline_reach is None:
+            baseline_z = self._baseline_z[arm]
+            if baseline_x is None or baseline_reach is None or baseline_z is None:
                 self._baseline_x[arm] = relative_x
                 self._baseline_reach[arm] = reach
+                self._baseline_z[arm] = relative_z
                 continue
             lateral = abs(relative_x - baseline_x)
             reach_gain = max(0.0, reach - baseline_reach)
-            previous_time, previous_lateral, previous_reach = self._signal[arm]
+            approach = abs(relative_z - baseline_z)
+            previous_time, previous_lateral, previous_reach, previous_approach = self._signal[arm]
             if previous_time < 0 or timestamp_ms - previous_time > 450:
                 previous_lateral = 0.0
                 previous_reach = 0.0
+                previous_approach = 0.0
             self._signal[arm] = (
                 timestamp_ms,
                 max(lateral, previous_lateral * 0.82),
                 max(reach_gain, previous_reach * 0.82),
+                max(approach, previous_approach * 0.82),
             )
-            if lateral < 0.04 and reach_gain < 0.03:
+            if lateral < 0.04 and reach_gain < 0.03 and approach < 0.03:
                 self._baseline_x[arm] = baseline_x * 0.97 + relative_x * 0.03
                 self._baseline_reach[arm] = baseline_reach * 0.97 + reach * 0.03
+                self._baseline_z[arm] = baseline_z * 0.97 + relative_z * 0.03
 
     def signals(self, arm: str | None, timestamp_ms: int) -> DepthSignals:
         arms = (arm,) if arm in {"left", "right"} else ("left", "right")
         best = DepthSignals(0.0, 0.0, 10_000)
         for selected in arms:
-            observed_ms, lateral, reach = self._signal[selected]
+            observed_ms, lateral, reach, approach = self._signal[selected]
             if observed_ms < 0:
                 continue
             age = timestamp_ms - observed_ms
             if age < best.age_ms:
-                best = DepthSignals(lateral, reach, age)
+                best = DepthSignals(lateral, reach, age, approach)
         return best
 
     def confirms(self, arm: str | None, timestamp_ms: int) -> bool:
         cue = self.signals(arm, timestamp_ms)
-        return cue.age_ms <= 350 and max(cue.lateral, cue.reach) >= 0.08
+        return cue.age_ms <= 350 and max(cue.lateral, cue.reach, cue.approach) >= 0.08
 
     def suggests_straight(self, arm: str | None, timestamp_ms: int) -> bool:
         cue = self.signals(arm, timestamp_ms)
-        return cue.age_ms <= 350 and cue.reach >= 0.10 and cue.reach >= cue.lateral * 0.90
+        return (
+            cue.age_ms <= 350
+            and cue.reach >= 0.10
+            and cue.reach >= cue.lateral * 0.90
+            and cue.reach >= cue.approach * 0.85
+        )
 
     def suggests_hook(self, arm: str | None, timestamp_ms: int) -> bool:
         cue = self.signals(arm, timestamp_ms)
-        return cue.age_ms <= 350 and cue.lateral >= 0.08 and cue.lateral > cue.reach * 1.15
+        if cue.age_ms > 350:
+            return False
+        lateral_hook = cue.lateral >= 0.08 and cue.lateral > cue.reach * 1.15
+        depth_hook = cue.approach >= 0.08 and cue.approach > cue.reach * 1.10
+        return lateral_hook or depth_hook
 
 
 def _relabel_event(event: PunchEvent, label_id: int) -> PunchEvent:
@@ -195,12 +235,18 @@ class MultiViewMonitor:
         self._previous_depth_center: tuple[float, float] | None = None
         self._previous_depth_scale: float | None = None
         self._stable_depth_frames = 0
+        self._recent_by_arm: dict[str, tuple[int, str | None, int | None]] = {}
         self.poses: dict[str, PoseObservation] = {}
         self.quality: tuple[ViewQuality, ...] = ()
         self.preview_bgr: NDArray[np.uint8] | None = None
         self.readiness = DepthReadiness()
         self.status_line = ""
         self.role_line = ""
+
+    def set_sensitivity(self, name: str) -> None:
+        self._depth_sensitivity = name
+        if self._depth_classifier is not None:
+            self._depth_classifier.set_sensitivity(name)
 
     def open(self, rig: CameraRig) -> None:
         self.role_line = "  ".join(
@@ -289,28 +335,39 @@ class MultiViewMonitor:
         mean_brightness = float(np.mean(gray))
         brightness_ok = 18.0 <= mean_brightness <= 238.0
         arm_quality = _arm_quality(pose)
-        stable = self._update_depth_stability(pose)
+        self._update_depth_stability(pose)
 
-        if not pose.detected:
+        hold_ready = bool(
+            (
+                self.readiness.ready
+                or self._stable_depth_frames >= DEPTH_REQUIRED_STABLE_FRAMES
+            )
+            and pose.detected
+            and brightness_ok
+            and sharpness >= DEPTH_HOLD_SHARPNESS
+            and arm_quality >= DEPTH_HOLD_ARM_QUALITY
+        )
+        if hold_ready:
+            status = f"DEPTH LISTA  FOCO {focus_score:.0%}"
+            ready = True
+        elif not pose.detected:
             status = "DEPTH BUSCANDO OBJETIVO"
+            ready = False
         elif sharpness < DEPTH_MIN_SHARPNESS:
             status = f"DEPTH AJUSTA ENFOQUE {focus_score:.0%}"
+            ready = False
         elif not brightness_ok:
             status = "DEPTH AJUSTA LUZ"
+            ready = False
         elif arm_quality < DEPTH_MIN_ARM_QUALITY:
             status = f"DEPTH MUESTRA BRAZOS {arm_quality:.0%}"
+            ready = False
         elif self._stable_depth_frames < DEPTH_REQUIRED_STABLE_FRAMES:
             status = "DEPTH ESTABILIZANDO OBJETIVO"
+            ready = False
         else:
             status = f"DEPTH LISTA  FOCO {focus_score:.0%}"
-
-        ready = bool(
-            pose.detected
-            and sharpness >= DEPTH_MIN_SHARPNESS
-            and brightness_ok
-            and arm_quality >= DEPTH_MIN_ARM_QUALITY
-            and self._stable_depth_frames >= DEPTH_REQUIRED_STABLE_FRAMES
-        )
+            ready = True
         return DepthReadiness(
             camera_ok=True,
             detected=pose.detected,
@@ -356,6 +413,12 @@ class MultiViewMonitor:
             stable = movement / scale <= 0.08 and scale_change <= 0.12
         if stable:
             self._stable_depth_frames += 1
+        elif (
+            self.readiness.ready
+            or self._stable_depth_frames >= DEPTH_REQUIRED_STABLE_FRAMES
+        ):
+            # El golpe mueve hombros: no se pierde LISTA si el objetivo sigue visible.
+            pass
         else:
             self._stable_depth_frames = 1
         self._previous_depth_center = center
@@ -415,46 +478,67 @@ class MultiViewMonitor:
         result: ClassificationResult,
         timestamp_ms: int,
     ) -> ClassificationResult:
-        """Añade golpes vistos solo por depth y evita duplicar los compartidos."""
+        """Une frontal y depth: una clase por brazo, sin duplicar entre fotogramas."""
 
         depth_result = self._depth_result
-        if depth_result is None or not depth_result.events:
-            return result
-
         depth_events = tuple(
             replace(
                 event,
                 source="depth",
                 event_id=f"depth:{event.event_id or timestamp_ms}:{event.arm}",
             )
-            for event in depth_result.events
+            for event in (depth_result.events if depth_result is not None else ())
         )
-        merged = list(result.events)
-        added = 0
-        for depth_event in depth_events:
-            if any(
-                self._same_physical_event(front_event, depth_event)
-                for front_event in result.events
-            ):
-                continue
-            if any(
-                self._same_physical_event(existing, depth_event)
-                for existing in merged
-            ):
-                continue
-            merged.append(depth_event)
-            added += 1
+        by_arm: dict[str, dict[str, PunchEvent]] = {}
+        unlabeled: list[PunchEvent] = []
+        for event in result.events:
+            if event.arm in {"left", "right"}:
+                by_arm.setdefault(event.arm, {})["front"] = event
+            else:
+                unlabeled.append(event)
+        for event in depth_events:
+            if event.arm in {"left", "right"}:
+                by_arm.setdefault(event.arm, {})["depth"] = event
 
-        if not added:
-            return replace(
-                result,
-                diagnostics={
-                    **result.diagnostics,
-                    "depth_fusion": "same_event",
-                },
-            )
+        merged = list(unlabeled)
+        reasons: list[str] = []
+        added = 0
+        for arm, pair in by_arm.items():
+            chosen, reason = self._choose_event(pair.get("front"), pair.get("depth"))
+            if chosen is None:
+                continue
+            if self._is_recent_duplicate(arm, chosen, timestamp_ms):
+                reasons.append("suppressed_duplicate")
+                continue
+            merged.append(chosen)
+            reasons.append(reason)
+            if reason == "added":
+                added += 1
+            ended = chosen.ended_ms if chosen.ended_ms is not None else timestamp_ms
+            self._recent_by_arm[arm] = (ended, chosen.event_id, chosen.label_id)
+
+        fusion = "+".join(dict.fromkeys(reasons)) if reasons else "none"
+        diagnostics = {
+            **result.diagnostics,
+            "depth_fusion": fusion,
+            "depth_events": added,
+        }
+        if not merged:
+            return replace(result, events=(), diagnostics=diagnostics)
+        if merged == list(result.events) and fusion in {"none", "front_only", "same_event"}:
+            return replace(result, diagnostics=diagnostics)
 
         latest = merged[-1]
+        debug = result.debug_lines
+        if added:
+            debug = debug + tuple(
+                f"depth detecto {event.display_name}" for event in depth_events
+            )
+        if "depth_preferred" in fusion:
+            debug = debug + ("depth impuso clase",)
+        candidate = result.candidate
+        if depth_result is not None and added:
+            candidate = depth_result.candidate or candidate
         return replace(
             result,
             status=STATUS_COMPLETED,
@@ -462,16 +546,50 @@ class MultiViewMonitor:
             display_name=latest.display_name,
             events=tuple(merged),
             active_arm=latest.arm,
-            candidate=depth_result.candidate or result.candidate,
+            candidate=candidate,
             rejection=None,
-            diagnostics={
-                **result.diagnostics,
-                "depth_fusion": "added",
-                "depth_events": added,
-            },
-            debug_lines=result.debug_lines
-            + tuple(f"depth detecto {event.display_name}" for event in depth_events),
+            diagnostics=diagnostics,
+            debug_lines=debug,
         )
+
+    def _choose_event(
+        self,
+        front: PunchEvent | None,
+        depth: PunchEvent | None,
+    ) -> tuple[PunchEvent | None, str]:
+        if front is None and depth is None:
+            return None, "none"
+        if front is None:
+            return depth, "added"
+        if depth is None:
+            return front, "front_only"
+        if front.label_id == depth.label_id or depth.label_id is None:
+            return front, "same_event"
+        return (
+            replace(
+                front,
+                label_id=depth.label_id,
+                display_name=depth.display_name,
+                arm=depth.arm or front.arm,
+                source="depth",
+            ),
+            "depth_preferred",
+        )
+
+    def _is_recent_duplicate(
+        self,
+        arm: str,
+        event: PunchEvent,
+        timestamp_ms: int,
+    ) -> bool:
+        recent = self._recent_by_arm.get(arm)
+        if recent is None:
+            return False
+        recent_ms, recent_id, _label = recent
+        if event.event_id is not None and event.event_id == recent_id:
+            return True
+        event_time = event.ended_ms if event.ended_ms is not None else timestamp_ms
+        return 0 <= event_time - recent_ms <= DEPTH_EVENT_DEDUPE_MS
 
     @staticmethod
     def _same_physical_event(first: PunchEvent, second: PunchEvent) -> bool:
@@ -494,11 +612,12 @@ class MultiViewMonitor:
             "depth_gate": self._config.depth_gate,
             "depth_lateral": round(cue.lateral, 3),
             "depth_reach": round(cue.reach, 3),
+            "depth_approach": round(cue.approach, 3),
             "depth_age_ms": cue.age_ms,
             "depth_status": self.status_line or "sin depth",
         }
         debug = result.debug_lines + (
-            f"depth lat {cue.lateral:.2f} alc {cue.reach:.2f}",
+            f"depth lat {cue.lateral:.2f} alc {cue.reach:.2f} z {cue.approach:.2f}",
             self.status_line or "depth inactiva",
         )
         if not result.events:
@@ -563,5 +682,7 @@ class MultiViewMonitor:
         self._previous_depth_center = None
         self._previous_depth_scale = None
         self._stable_depth_frames = 0
+        self._recent_by_arm.clear()
+        self._depth = _DepthMotionCue()
         self.status_line = ""
         self.role_line = ""
