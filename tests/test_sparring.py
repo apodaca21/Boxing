@@ -196,7 +196,7 @@ class SparringCombinationTests(unittest.TestCase):
         frames = _partial_jab(0)[:4]
         frames.extend(
             _features(160 + index * 40, left_missing=True, right_missing=True)
-            for index in range(10)
+            for index in range(16)
         )
         results = _feed(_high(), frames)
         self.assertFalse(any(result.counted for result in results))

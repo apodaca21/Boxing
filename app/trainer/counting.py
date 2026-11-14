@@ -122,8 +122,16 @@ def rows_for(
     source: str,
     counts: dict[int, int],
     named_counts: dict[str, int],
+    *,
+    arm_only: bool = False,
 ) -> tuple[CounterRow, ...]:
     """Construye las mismas filas para el entrenador y la ronda libre."""
+
+    if arm_only and source == "heuristic":
+        return (
+            ("Golpes izquierdos", counts.get(1, 0), "left"),
+            ("Golpes derechos", counts.get(2, 0), "right"),
+        )
 
     if source == "external":
         return (

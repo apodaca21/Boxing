@@ -97,9 +97,13 @@ sincronización. La vista `depth` también ejecuta un detector biomecánico de
 respaldo: si la frontal pierde un golpe pero la secundaria completa el ciclo,
 se cuenta; si ambas lo ven, se deduplica para no sumar dos veces.
 
+Los problemas abiertos de la Steren (no es profundidad métrica), la confusión
+jab/gancho y la pérdida de muñecas a mitad de sesión están documentados en
+[`docs/problemas_profundidad.md`](docs/problemas_profundidad.md).
+
 La selección también aplica a `track`, `collect`, `benchmark`, `calibrate`,
-`targets` y `game`. Si una cámara auxiliar se desconecta, la sesión termina con
-un error explícito para no continuar contando con una configuración distinta.
+`targets` y `game`. Si una cámara auxiliar se desconecta, se desactiva esa vista
+y el frontal continúa sin detener el conteo principal.
 
 `--consent` confirma explícitamente la captura local. La persona elige la
 etiqueta y revisa visualmente el esqueleto en la ventana antes de continuar;
@@ -277,11 +281,17 @@ base. La comparación es descriptiva y no afirma que NEAT sea superior.
 
 ```bash
 python main.py --mode live --classifier heuristic
+
+# Recomendado si solo necesitas separar los brazos y estabilizar la webcam
+python main.py --mode live --classifier heuristic --arm-only \
+  --camera-setup single --camera-index 0 --depth-gate off
 python main.py --mode live --classifier neat
 python main.py --mode live --classifier external
 ```
 
-El modo abre la webcam, dibuja el seguimiento y muestra contadores. La sesión
+El modo abre la webcam, dibuja el seguimiento y muestra contadores. La webcam
+principal incluye una guía blanca con centro, zona izquierda/derecha y
+referencia arriba/abajo para colocar hombros y manos. La sesión
 empieza contando. `P` o la barra espaciadora pausan y reanudan, `R` reinicia y
 `Q` cierra. En el perfil normal un golpe se cuenta cuando el brazo completa
 salida y regreso; dejar el brazo extendido no acumula repeticiones. La
@@ -335,6 +345,14 @@ archivo.
 ```bash
 python main.py --mode live --classifier heuristic --training-style sparring
 ```
+
+En `live`, si no se indica `--sensitivity`, se usa `high` para priorizar la
+captura de golpes cortos o centrados. `--sensitivity normal` y la tecla `1`
+permiten volver al umbral conservador.
+
+`--arm-only` es el modo sencillo para una sola webcam: solo requiere que se
+vean hombros, codos y muñecas, y confirma cada trayectoria como golpe izquierdo
+o derecho. No exige ver el cuerpo completo y no intenta distinguir jab/gancho.
 
 Estos perfiles son una hipótesis inicial. Las pruebas automáticas usan
 secuencias sintéticas y no demuestran la precisión frente a la webcam.
@@ -532,3 +550,17 @@ recopilación guarda muestras que superan las reglas de calidad y el
 entrenamiento NEAT solo continúa cuando el dataset real permite una división
 por sesiones. El reconocimiento frente a la webcam con el LSTM depende de
 que haya una persona en cuadro; una imagen vacía no produce golpes.
+
+## Vision Lab: segmentación auxiliar
+
+La implementación incremental de la Fase 1 está documentada en
+[`docs/vision_lab.md`](docs/vision_lab.md). La Steren se usa como señal visual
+auxiliar; los clasificadores, el conteo, los modos actuales y la cámara
+principal permanecen sin cambios de decisión.
+
+Al finalizar `live`, `targets` o `game` con `E`/`Q`, se guardan trayectorias,
+biomecánica y mapas en `results/sessions/<session-id>/`; la pantalla final usa
+`1` resumen, `2` trayectorias, `3` mapas, `4` exportaciones y `Q` cerrar. La
+Steren RGB aporta actividad 2D, no profundidad 3D métrica. Los heatmaps se
+superponen sobre una única captura representativa de la MacBook (y de la
+Steren si está disponible), no sobre un canvas negro; no se guarda video.

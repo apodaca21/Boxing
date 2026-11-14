@@ -151,6 +151,16 @@ def _draw_skeleton(
         cv2.circle(image, point, 6, _joint_color(landmark_id, config), -1, cv2.LINE_AA)
         cv2.circle(image, point, 8, (25, 28, 34), 2, cv2.LINE_AA)
 
+    # La etiqueta es anatómica, no la posición en pantalla. Al espejar la
+    # imagen sólo cambia el dibujo; LEFT/RIGHT de MediaPipe no se intercambia.
+    for label, wrist_id in (("L", LandmarkId.LEFT_WRIST), ("R", LandmarkId.RIGHT_WRIST)):
+        wrist = pose.landmark(wrist_id)
+        if not _visible(wrist, config):
+            continue
+        x, y = _to_pixel(wrist, width, height, config.mirror_view)
+        cv2.putText(image, label, (x + 10, y - 8), cv2.FONT_HERSHEY_DUPLEX, 0.48, (15, 18, 22), 3, cv2.LINE_AA)
+        cv2.putText(image, label, (x + 10, y - 8), cv2.FONT_HERSHEY_DUPLEX, 0.48, (250, 250, 250), 1, cv2.LINE_AA)
+
 
 def _format_angle(angle: float | None) -> str:
     return "--" if angle is None else f"{angle:5.1f} deg"
@@ -400,6 +410,51 @@ def _format_clock(elapsed_ms: int) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def _draw_camera_guide(image: NDArray[np.uint8]) -> None:
+    """Dibuja una guía de encuadre sobre la zona principal de la webcam.
+
+    La vista live reserva una columna izquierda para el HUD. La guía se coloca
+    únicamente en el video, para que el centro corresponda al cuerpo de la
+    persona y no al canvas completo.
+    """
+
+    height, width = image.shape[:2]
+    panel_width = min(250, max(180, width // 3))
+    video_left = min(max(panel_width + 1, 0), max(0, width - 1))
+    video_width = max(1, width - video_left)
+    center_x = video_left + video_width // 2
+    center_y = height // 2
+    margin_x = max(18, int(video_width * 0.14))
+    top = max(18, int(height * 0.14))
+    bottom = min(height - 18, int(height * 0.88))
+    left = video_left + margin_x
+    right = width - margin_x
+
+    layer = image.copy()
+    white = (245, 245, 245)
+    dim_white = (205, 205, 205)
+    cv2.rectangle(layer, (left, top), (right, bottom), dim_white, 2, cv2.LINE_AA)
+    cv2.line(layer, (center_x, top), (center_x, bottom), white, 2, cv2.LINE_AA)
+    cv2.line(layer, (left, center_y), (right, center_y), white, 2, cv2.LINE_AA)
+    cv2.line(layer, (center_x - 12, center_y), (center_x + 12, center_y), white, 4, cv2.LINE_AA)
+    cv2.line(layer, (center_x, center_y - 12), (center_x, center_y + 12), white, 4, cv2.LINE_AA)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    labels = (
+        ("IZQUIERDA", left + 10, top + 25),
+        ("DERECHA", center_x + 10, top + 25),
+        ("ARRIBA", left + 10, center_y - 10),
+        ("ABAJO / GUARDIA", left + 10, bottom - 12),
+        ("COLOCA HOMBROS AQUI", center_x - 92, top - 10),
+    )
+    for text, x, y in labels:
+        cv2.putText(layer, text, (x, y), font, 0.43, (20, 22, 26), 3, cv2.LINE_AA)
+        cv2.putText(layer, text, (x, y), font, 0.43, white, 1, cv2.LINE_AA)
+
+    # Transparente para que no tape el esqueleto ni las manos.
+    cv2.addWeighted(layer, 0.62, image, 0.38, 0.0, dst=image)
+
+
 def _draw_live(
     image: NDArray[np.uint8],
     pose: PoseObservation,
@@ -443,7 +498,10 @@ def _draw_live(
         badge = "MODELO: HEURISTICO"
         badge_color = (70, 175, 255)
     cv2.putText(image, _opencv_text(badge), (16, 54), body_font, 0.38, badge_color, 1, cv2.LINE_AA)
-    style = "SPARRING" if view.training_style == "sparring" else "LIBRE"
+    if view.arm_only:
+        style = "SOLO BRAZOS"
+    else:
+        style = "SPARRING" if view.training_style == "sparring" else "LIBRE"
     cv2.putText(
         image,
         _opencv_text(f"{style}  {view.sensitivity}"),
@@ -456,25 +514,33 @@ def _draw_live(
     )
 
     person_detected = pose.detected
-    status = "PERSONA DETECTADA" if person_detected else "BUSCANDO PERSONA"
-    status_color = config.color_success if person_detected else config.color_searching
+    if view.awaiting_setup:
+        status = "AJUSTA CAMARA" if not view.setup_ready else "LISTO PARA EMPEZAR"
+        status_color = config.color_success if view.setup_ready else (70, 175, 255)
+    else:
+        status = "PERSONA DETECTADA" if person_detected else "BUSCANDO PERSONA"
+        status_color = config.color_success if person_detected else config.color_searching
     cv2.circle(image, (22, 94), 5, status_color, -1, cv2.LINE_AA)
     cv2.putText(image, status, (34, 99), body_font, 0.42, status_color, 1, cv2.LINE_AA)
 
     cv2.putText(
         image,
-        "CANDIDATO" if view.moving else "GOLPE",
+        "AJUSTE" if view.awaiting_setup else ("CANDIDATO" if view.moving else "GOLPE"),
         (16, 124),
         body_font,
         0.40,
-        (40, 180, 255) if view.moving else (150, 158, 170),
+        (70, 175, 255) if view.awaiting_setup else ((40, 180, 255) if view.moving else (150, 158, 170)),
         1,
         cv2.LINE_AA,
     )
-    shown = view.candidate if view.moving else view.recognition
+    shown = (
+        view.setup_status
+        if view.awaiting_setup
+        else (view.candidate if view.moving else view.recognition)
+    )
     cv2.putText(
         image,
-        _opencv_text(shown),
+        _opencv_text(shown)[:28],
         (16, 148),
         title_font,
         0.48,
@@ -545,18 +611,27 @@ def _draw_live(
             1,
             cv2.LINE_AA,
         )
-    state = "EN MARCHA" if view.running else "EN PAUSA"
+    if view.awaiting_setup:
+        state = "ENTER EMPIEZA" if view.setup_ready else "ESPERANDO AJUSTE"
+        state_color = config.color_success if view.setup_ready else (70, 175, 255)
+    else:
+        state = "EN MARCHA" if view.running else "EN PAUSA"
+        state_color = config.color_success if view.running else (170, 177, 188)
     cv2.putText(
         image,
         state,
         (16, height - 36),
         body_font,
         0.42,
-        config.color_success if view.running else (170, 177, 188),
+        state_color,
         1,
         cv2.LINE_AA,
     )
-    controls = "1-3 sens  D debug  C calibra"
+    controls = (
+        "ENTER empieza  R reinicia  Q sale"
+        if view.awaiting_setup
+        else "1-3 sens  D debug  C calibra"
+    )
     if view.camera_line:
         controls = "F intercambia  " + controls
     cv2.putText(
@@ -569,7 +644,7 @@ def _draw_live(
         1,
         cv2.LINE_AA,
     )
-    if view.depth_status or view.camera_line:
+    if view.depth_status or view.camera_line or view.awaiting_setup:
         depth_y = summary_y + len(summary) * 20 + 8
         if view.camera_line:
             cv2.putText(
@@ -579,6 +654,19 @@ def _draw_live(
                 body_font,
                 0.36,
                 (180, 190, 205),
+                1,
+                cv2.LINE_AA,
+            )
+            depth_y += 18
+        if view.awaiting_setup:
+            front_line = "FRONT LISTA" if view.front_ready else "FRONT AJUSTAR"
+            cv2.putText(
+                image,
+                _opencv_text(front_line)[:34],
+                (16, depth_y),
+                body_font,
+                0.36,
+                (80, 220, 120) if view.front_ready else (70, 175, 255),
                 1,
                 cv2.LINE_AA,
             )
@@ -594,6 +682,67 @@ def _draw_live(
                 1,
                 cv2.LINE_AA,
             )
+
+    if view.awaiting_setup:
+        banner = (
+            "CAMARAS LISTAS  ENTER PARA EMPEZAR"
+            if view.setup_ready
+            else _opencv_text(view.setup_status or "AJUSTA CAMARA PARA MEDIR ANGULOS")
+        )
+        banner_color = (60, 200, 110) if view.setup_ready else (40, 150, 255)
+        cv2.rectangle(
+            image,
+            (panel_width + 12, 12),
+            (width - 12, 58),
+            (12, 14, 18),
+            -1,
+        )
+        cv2.putText(
+            image,
+            banner[:48],
+            (panel_width + 22, 42),
+            title_font,
+            0.55,
+            banner_color,
+            1,
+            cv2.LINE_AA,
+        )
+    elif view.arm_hint:
+        cv2.rectangle(
+            image,
+            (panel_width + 12, 12),
+            (width - 12, 58),
+            (12, 14, 18),
+            -1,
+        )
+        cv2.putText(
+            image,
+            _opencv_text(view.arm_hint)[:48],
+            (panel_width + 22, 42),
+            title_font,
+            0.52,
+            (40, 150, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    arm_y = 112
+    for label, ok, color in (
+        ("I", view.left_arm_ok, config.color_left),
+        ("D", view.right_arm_ok, config.color_right),
+    ):
+        fill = color if ok else (70, 75, 85)
+        cv2.circle(image, (panel_width + 28 if label == "I" else panel_width + 58, arm_y), 7, fill, -1, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            label,
+            (panel_width + 22 if label == "I" else panel_width + 52, arm_y + 4),
+            body_font,
+            0.35,
+            (12, 14, 18) if ok else (160, 165, 175),
+            1,
+            cv2.LINE_AA,
+        )
 
     if view.moving:
         cv2.circle(image, (panel_width + 18, 28), 7, (40, 180, 255), -1, cv2.LINE_AA)
@@ -808,6 +957,7 @@ def _draw_depth_pip(
     *,
     mirror: bool,
     ready: bool = False,
+    label: str = "DEPTH",
 ) -> None:
     """Miniatura de la webcam de profundidad sobre la esquina de la frontal."""
 
@@ -838,7 +988,7 @@ def _draw_depth_pip(
     cv2.rectangle(image, (x0, y0 - 22), (x0 + pip_w - 1, y0), (12, 14, 18), -1)
     cv2.putText(
         image,
-        "DEPTH  LISTA" if ready else "DEPTH  AJUSTAR",
+        f"{label}  LISTA" if ready else f"{label}  AJUSTAR",
         (x0 + 8, y0 - 6),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.38,
@@ -866,6 +1016,8 @@ def render_frame(
     targets: TargetView | None = None,
     overlay: bool = True,
     aux_frame: NDArray[np.uint8] | None = None,
+    aux_label: str = "DEPTH",
+    aux_ready: bool | None = None,
 ) -> NDArray[np.uint8]:
     """Devuelve una vista anotada sin modificar el fotograma de captura."""
 
@@ -874,6 +1026,8 @@ def render_frame(
         if config.mirror_view
         else np.array(frame_bgr, copy=True)
     )
+    if live is not None:
+        _draw_camera_guide(output)
     if pose.detected:
         highlight = None if live is None else live.highlight_arm
         _draw_skeleton(output, pose, config, highlight)
@@ -889,11 +1043,12 @@ def render_frame(
         _draw_collection(output, collection, config)
     if benchmark is not None:
         _draw_benchmark(output, benchmark, config)
-    if aux_frame is not None and live is not None:
+    if aux_frame is not None:
         _draw_depth_pip(
             output,
             aux_frame,
             mirror=config.mirror_view,
-            ready=live.depth_ready,
+            ready=(bool(live is not None and live.depth_ready) if aux_ready is None else aux_ready),
+            label=aux_label,
         )
     return output

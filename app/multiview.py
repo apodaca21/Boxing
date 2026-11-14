@@ -262,7 +262,10 @@ class MultiViewMonitor:
                 min_tracking_confidence=self._config.min_tracking_confidence,
             )
             self._depth_classifier = HeuristicClassifier(
-                profile_settings(self._depth_sensitivity)
+                replace(
+                    profile_settings(self._depth_sensitivity),
+                    arm_only=self._config.arm_only,
+                )
             )
 
     def observe(self, frame: RigFrame, rig: CameraRig) -> dict[str, PoseObservation]:
@@ -500,17 +503,40 @@ class MultiViewMonitor:
             if event.arm in {"left", "right"}:
                 by_arm.setdefault(event.arm, {})["depth"] = event
 
+        side_conflict = False
+        front_candidates = [event for event in result.events if event.arm in {"left", "right"}]
+        depth_candidates = [event for event in depth_events if event.arm in {"left", "right"}]
+        if len(front_candidates) == 1 and len(depth_candidates) == 1:
+            front_event = front_candidates[0]
+            depth_event = depth_candidates[0]
+            front_time = front_event.ended_ms if front_event.ended_ms is not None else timestamp_ms
+            depth_time = depth_event.ended_ms if depth_event.ended_ms is not None else timestamp_ms
+            side_conflict = (
+                front_event.arm != depth_event.arm
+                and abs(front_time - depth_time) <= DEPTH_EVENT_DEDUPE_MS
+            )
+            if side_conflict:
+                by_arm[depth_event.arm].pop("depth", None)
+
         merged = list(unlabeled)
         reasons: list[str] = []
         added = 0
         for arm, pair in by_arm.items():
-            chosen, reason = self._choose_event(pair.get("front"), pair.get("depth"))
+            chosen, reason = self._choose_event(
+                pair.get("front"),
+                pair.get("depth"),
+                timestamp_ms,
+            )
             if chosen is None:
+                if reason == "depth_unready":
+                    reasons.append(reason)
                 continue
             if self._is_recent_duplicate(arm, chosen, timestamp_ms):
                 reasons.append("suppressed_duplicate")
                 continue
             merged.append(chosen)
+            if side_conflict and reason == "front_only":
+                reason = "front_side_conflict"
             reasons.append(reason)
             if reason == "added":
                 added += 1
@@ -525,7 +551,13 @@ class MultiViewMonitor:
         }
         if not merged:
             return replace(result, events=(), diagnostics=diagnostics)
-        if merged == list(result.events) and fusion in {"none", "front_only", "same_event"}:
+        if merged == list(result.events) and fusion in {
+            "none",
+            "front_only",
+            "same_event",
+            "front_class_kept",
+            "front_side_conflict",
+        }:
             return replace(result, diagnostics=diagnostics)
 
         latest = merged[-1]
@@ -534,8 +566,8 @@ class MultiViewMonitor:
             debug = debug + tuple(
                 f"depth detecto {event.display_name}" for event in depth_events
             )
-        if "depth_preferred" in fusion:
-            debug = debug + ("depth impuso clase",)
+        if "front_class_kept" in fusion:
+            debug = debug + ("frontal conservo jab/gancho",)
         candidate = result.candidate
         if depth_result is not None and added:
             candidate = depth_result.candidate or candidate
@@ -556,25 +588,34 @@ class MultiViewMonitor:
         self,
         front: PunchEvent | None,
         depth: PunchEvent | None,
+        timestamp_ms: int,
     ) -> tuple[PunchEvent | None, str]:
         if front is None and depth is None:
             return None, "none"
         if front is None:
-            return depth, "added"
+            # La Steren sola inventaba ganchos con pose lateral ruidosa. Solo
+            # se acepta un golpe exclusivo de depth si ya está lista o el cue
+            # de movimiento confirma el brazo.
+            if depth is None:
+                return None, "none"
+            if self.readiness.ready or self._depth.confirms(depth.arm, timestamp_ms):
+                return depth, "added"
+            return None, "depth_unready"
         if depth is None:
             return front, "front_only"
+        # La vista frontal sigue siendo la autoridad anatómica. Una cámara
+        # lateral/RGB puede invertir la lectura izquierda-derecha por su
+        # encuadre o espejado; no permitimos que esa contradicción cambie el
+        # lado del evento ya detectado en la frontal.
+        if front.arm in {"left", "right"} and depth.arm in {"left", "right"} and front.arm != depth.arm:
+            return front, "front_side_conflict"
         if front.label_id == depth.label_id or depth.label_id is None:
             return front, "same_event"
-        return (
-            replace(
-                front,
-                label_id=depth.label_id,
-                display_name=depth.display_name,
-                arm=depth.arm or front.arm,
-                source="depth",
-            ),
-            "depth_preferred",
-        )
+        # Tampoco dejamos que el clasificador depth pise jab<->gancho: en la
+        # última sesión convertía rectos largos en ganchos. El cue de movimiento
+        # (_assist) sí puede corregir la clase cuando la geometría lateral lo
+        # respalda.
+        return front, "front_class_kept"
 
     def _is_recent_duplicate(
         self,
@@ -621,6 +662,11 @@ class MultiViewMonitor:
             self.status_line or "depth inactiva",
         )
         if not result.events:
+            return replace(result, diagnostics=diagnostics, debug_lines=debug)
+
+        # En el modo por brazo la cámara auxiliar solo aporta respaldo de
+        # movimiento. No debe volver a inventar una clase jab/gancho.
+        if self._config.arm_only:
             return replace(result, diagnostics=diagnostics, debug_lines=debug)
 
         rewritten: list[PunchEvent] = []

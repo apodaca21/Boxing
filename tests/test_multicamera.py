@@ -10,7 +10,7 @@ import numpy as np
 from app.camera import CameraInfo, CameraRig, FramePacket
 from app.camera_identity import NamedCamera, suggest_depth_pair
 from app.config import AppConfig
-from app.multiview import MultiViewMonitor, _DepthMotionCue, _focus_measure
+from app.multiview import DepthReadiness, MultiViewMonitor, _DepthMotionCue, _focus_measure
 from app.pose_tracker import LandmarkId, LandmarkObservation, PoseObservation
 from app.trainer.results import ClassificationResult, PunchEvent
 from main import parse_args
@@ -123,6 +123,7 @@ class DepthAssistTests(unittest.TestCase):
         monitor = MultiViewMonitor(
             AppConfig(camera_setup="depth", camera_depth_index=1, depth_gate="strict")
         )
+        monitor.readiness = DepthReadiness(camera_ok=True, detected=True, ready=True, status="DEPTH LISTA")
         monitor._depth_result = ClassificationResult(
             source="heuristic",
             status="completado",
@@ -185,9 +186,10 @@ class DepthAssistTests(unittest.TestCase):
         fused = monitor.filter_result(front, 220)
         self.assertEqual(len(fused.events), 1)
         self.assertEqual(fused.events[0].event_id, "front:left:210")
-        self.assertEqual(fused.events[0].label_id, 3)
-        self.assertEqual(fused.events[0].display_name, "Gancho izquierdo")
-        self.assertEqual(fused.diagnostics.get("depth_fusion"), "depth_preferred")
+        # Depth ya no pisa jab<->gancho a ciegas; el cue de movimiento lo corrige.
+        self.assertEqual(fused.events[0].label_id, 1)
+        self.assertEqual(fused.events[0].display_name, "Jab izquierdo")
+        self.assertEqual(fused.diagnostics.get("depth_fusion"), "front_class_kept")
 
     def test_same_label_from_both_cameras_is_not_duplicated(self) -> None:
         monitor = MultiViewMonitor(
@@ -218,10 +220,36 @@ class DepthAssistTests(unittest.TestCase):
         self.assertEqual(fused.events[0].event_id, "front:left:210")
         self.assertEqual(fused.diagnostics.get("depth_fusion"), "same_event")
 
+    def test_front_camera_wins_when_auxiliary_inverts_anatomical_side(self) -> None:
+        monitor = MultiViewMonitor(
+            AppConfig(camera_setup="depth", camera_depth_index=1, depth_gate="soft")
+        )
+        monitor._depth_result = ClassificationResult(
+            source="heuristic",
+            status="completado",
+            label_id=3,
+            display_name="Gancho izquierdo",
+            events=(PunchEvent(3, "Gancho izquierdo", "left", event_id="depth:left:220", ended_ms=220),),
+            active_arm="left",
+        )
+        front = ClassificationResult(
+            source="heuristic",
+            status="completado",
+            label_id=4,
+            display_name="Gancho derecho",
+            events=(PunchEvent(4, "Gancho derecho", "right", event_id="front:right:220", ended_ms=220),),
+            active_arm="right",
+        )
+        fused = monitor.filter_result(front, 220)
+        self.assertEqual(fused.events[0].arm, "right")
+        self.assertEqual(fused.events[0].label_id, 4)
+        self.assertIn("front_side_conflict", str(fused.diagnostics.get("depth_fusion")))
+
     def test_late_front_event_does_not_double_count_depth_punch(self) -> None:
         monitor = MultiViewMonitor(
             AppConfig(camera_setup="depth", camera_depth_index=1, depth_gate="soft")
         )
+        monitor.readiness = DepthReadiness(camera_ok=True, detected=True, ready=True, status="DEPTH LISTA")
         monitor._depth_result = ClassificationResult(
             source="heuristic",
             status="completado",

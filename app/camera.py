@@ -25,6 +25,16 @@ class FramePacket:
     timestamp_ms: int
     width: int
     height: int
+    # Extensión compatible: los consumidores antiguos siguen usando ms; los
+    # módulos de sincronización y biomecánica pueden usar el reloj monotónico
+    # de mayor resolución.
+    timestamp_ns: int = 0
+    # Identidad de mejor esfuerzo: los índices OpenCV pueden cambiar entre
+    # reinicios, por eso se conserva también el backend y el índice observado.
+    camera_id: str = ""
+    rotation_deg: int = 0
+    display_mirrored: bool = False
+    valid: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +81,7 @@ class Camera:
         self._pending_frame: NDArray[np.uint8] | None = None
         self._frame_index = 0
         self._last_timestamp_ms = -1
+        self._last_timestamp_ns = -1
         self.backend_name: str | None = None
 
     def _candidate_backends(self) -> list[tuple[int, str]]:
@@ -122,6 +133,7 @@ class Camera:
             self._pending_frame = first_frame
             self._frame_index = 0
             self._last_timestamp_ms = -1
+            self._last_timestamp_ns = -1
             self.backend_name = name
             return
 
@@ -133,12 +145,17 @@ class Camera:
             "y seguridad > Cámara."
         )
 
-    def _next_timestamp_ms(self) -> int:
-        timestamp_ms = self._clock_ns() // 1_000_000
+    def _next_timestamp(self) -> tuple[int, int]:
+        timestamp_ns = self._clock_ns()
+        if timestamp_ns <= self._last_timestamp_ns:
+            timestamp_ns = self._last_timestamp_ns + 1
+        timestamp_ms = timestamp_ns // 1_000_000
         if timestamp_ms <= self._last_timestamp_ms:
             timestamp_ms = self._last_timestamp_ms + 1
+            timestamp_ns = max(timestamp_ns, timestamp_ms * 1_000_000)
+        self._last_timestamp_ns = timestamp_ns
         self._last_timestamp_ms = timestamp_ms
-        return timestamp_ms
+        return timestamp_ms, timestamp_ns
 
     def read(self) -> FramePacket:
         if self._capture is None or not self._capture.isOpened():
@@ -156,12 +173,15 @@ class Camera:
                 )
 
         height, width = frame.shape[:2]
+        timestamp_ms, timestamp_ns = self._next_timestamp()
         packet = FramePacket(
             frame=frame,
             frame_index=self._frame_index,
-            timestamp_ms=self._next_timestamp_ms(),
+            timestamp_ms=timestamp_ms,
             width=width,
             height=height,
+            timestamp_ns=timestamp_ns,
+            camera_id=f"opencv:{self.backend_name or 'unknown'}:{self.index}",
         )
         self._frame_index += 1
         return packet
@@ -377,7 +397,18 @@ class CameraRig:
 
         if not self._cameras:
             raise CameraError("El rig de cámaras no está abierto.")
-        packets = {role: camera.read() for role, camera in self._cameras.items()}
+        packets: dict[str, FramePacket] = {}
+        for role, camera in list(self._cameras.items()):
+            try:
+                packets[role] = camera.read()
+            except CameraError:
+                if role == "front":
+                    raise
+                # La vista externa es auxiliar: se desactiva localmente para
+                # que la captura principal y su contador puedan continuar.
+                camera.release()
+                self._cameras.pop(role, None)
+                self._resolved_indices.pop(role, None)
         primary = packets["front"]
         self._last_frame = RigFrame(primary=primary, by_role=packets)
         return primary

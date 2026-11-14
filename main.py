@@ -195,6 +195,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--arm-only",
+        action="store_true",
+        help=(
+            "Modo sencillo: detecta y cuenta solo golpe izquierdo/derecho; "
+            "no intenta separar jab de gancho."
+        ),
+    )
+    parser.add_argument(
         "--list-cameras",
         action="store_true",
         help="Prueba índices de cámara disponibles y termina sin abrir el entrenador.",
@@ -315,12 +323,12 @@ def parse_args() -> argparse.Namespace:
         "--training-style",
         choices=("libre", "sparring"),
         default="libre",
-        help="sparring prioriza combinaciones y usa sensibilidad high si no se indica otra.",
+        help="sparring prioriza combinaciones; live inicia en sensibilidad high si no se indica otra.",
     )
     parser.add_argument(
         "--sensitivity",
         choices=("normal", "high", "maximum", "play"),
-        help="Perfil del detector. En el juego, play es el predeterminado. En sparring, high.",
+        help="Perfil del detector. live usa high por defecto; el juego heurístico usa play.",
     )
     parser.add_argument(
         "--repetitions",
@@ -491,11 +499,21 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     from app.trainer.calibration import MotionCalibrator
     from app.trainer.diagnostics import DiagnosticLog
     from app.trainer.factory import create_classifier
+    from app.trainer.preflight import (
+        FRONT_SHOULDER_MAX_WIDTH,
+        FrontSetupTracker,
+        arm_tracking_ok,
+    )
     from app.multiview import MultiViewMonitor
+    from app.vision_lab.ui_integration import ExternalVisionLab
+    from app.vision_lab.session_recorder import SessionRecorder
+    from app.vision_lab.session_report import show_session_analysis
 
     sensitivity = args.sensitivity
     if sensitivity is None:
-        sensitivity = "high" if args.training_style == "sparring" else "normal"
+        # El modo live prioriza no perder un golpe corto o centrado. Se puede
+        # bajar explícitamente con --sensitivity normal o con la tecla 1.
+        sensitivity = "high"
     classifier = create_classifier(
         args.classifier,
         neat_model=args.neat_model,
@@ -503,6 +521,14 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
         external_dir=args.external_model,
         sensitivity=sensitivity,
     )
+    if args.arm_only and classifier.name != "heuristic":
+        print("--arm-only solo aplica al clasificador heuristic.")
+        close = getattr(classifier, "close", None)
+        if close is not None:
+            close()
+        return 2
+    if args.arm_only:
+        classifier.apply_settings(replace(classifier.settings, arm_only=True))
     if args.calibration is not None:
         if classifier.name != "heuristic":
             print("--calibration solo aplica al clasificador heurístico.")
@@ -510,23 +536,37 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
         from app.trainer.calibration_session import load_proposed_settings
 
         classifier.apply_settings(load_proposed_settings(args.calibration.expanduser().resolve()))
+        if args.arm_only:
+            classifier.apply_settings(replace(classifier.settings, arm_only=True))
         print(f"Propuesta de calibración aplicada explícitamente: {args.calibration}")
     tune = getattr(classifier, "set_sensitivity", None)
     if tune is not None and classifier.name != "heuristic":
         tune(sensitivity)
     config = resolve_depth_config(config, args)
     config.validate()
-    session = TrainingSession()
+    session = TrainingSession(
+        require_camera_setup=True,
+        arm_only=bool(args.arm_only and classifier.name == "heuristic"),
+    )
     session.source = classifier.name
     session.provisional = classifier.provisional
     session.training_style = args.training_style
     session.sensitivity = sensitivity.upper()
+    front_setup = FrontSetupTracker(config)
     calibrator = MotionCalibrator()
     diagnostics = DiagnosticLog()
     default_sensitivity = sensitivity
     fps_meter = FrameRateMeter(config.fps_window_size)
     camera = camera_for_config(config)
     multiview = MultiViewMonitor(config, depth_sensitivity=sensitivity)
+    # La Steren se procesa como señal auxiliar visual. No se entrega al
+    # clasificador ni al ledger: la decisión actual sigue siendo la frontal.
+    vision_lab = ExternalVisionLab()
+    recorder = SessionRecorder(
+        args.results_dir,
+        classifier=classifier.name,
+        session_kind="live" if args.training_style != "sparring" else "sparring",
+    )
     if classifier.name == "external":
         print("Entrenador en vivo con YOLO Pose y el LSTM preentrenado.")
         print("Las activaciones no se muestran como probabilidades calibradas.")
@@ -538,8 +578,12 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
     if args.training_style == "sparring":
         print("Modo sparring. Cada brazo confirma al frenar, sin esperar la guardia exacta.")
     print(f"Sensibilidad inicial: {sensitivity}.")
+    if args.arm_only:
+        print("Modo ARM-ONLY: solo cuenta golpe izquierdo/derecho; no clasifica jab/gancho.")
     print("1 normal, 2 alta, 3 máxima, 0 restaura, D diagnóstico, C calibración.")
-    print("P pausa o reanuda, R reinicia y Q cierra. La sesión ya está contando.")
+    print("Steren: B calibra fondo, V cambia RGB/silueta/movimiento/overlay, +/- umbral, I ROI.")
+    print("Primero ajusta las camaras: no cuenta hasta FRONT/DEPTH listas y ENTER.")
+    print("P pausa, R reinicia el ajuste, E/Q finaliza y abre el análisis.")
     if config.camera_setup != "single":
         print(
             "Rig de cámaras: "
@@ -559,6 +603,14 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
             multiview.open(camera)
+            recorder.update_metadata(
+                camera_roles=camera.role_indices,
+                frame_width=config.frame_width,
+                frame_height=config.frame_height,
+                mirror_view=config.mirror_view,
+                external_processing_width=vision_lab.process_width,
+                arm_only=args.arm_only,
+            )
             if len(camera.role_indices) > 1:
                 print(
                     "Roles activos: "
@@ -575,10 +627,39 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                 packet = camera.read()
                 if camera.last_frame is not None:
                     multiview.observe(camera.last_frame, camera)
+                    vision_telemetry = vision_lab.observe(camera.last_frame)
+                else:
+                    vision_telemetry = vision_lab.telemetry
                 session.depth_status = multiview.status_line
-                session.depth_ready = multiview.readiness.ready
+                if vision_telemetry.external_role is not None:
+                    session.depth_status = (
+                        f"{session.depth_status} | {vision_telemetry.status}"
+                        if session.depth_status
+                        else vision_telemetry.status
+                    )
                 session.camera_line = multiview.role_line or session.camera_line
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
+                front_readiness = front_setup.observe(pose)
+                depth_required = config.camera_setup == "depth"
+                session.update_camera_setup(
+                    front_ready=front_readiness.ready,
+                    front_status=front_readiness.status,
+                    depth_ready=multiview.readiness.ready,
+                    depth_required=depth_required,
+                    depth_status=multiview.readiness.status,
+                )
+                left_s = pose.landmark(LandmarkId.LEFT_SHOULDER)
+                right_s = pose.landmark(LandmarkId.RIGHT_SHOULDER)
+                too_close = bool(
+                    left_s is not None
+                    and right_s is not None
+                    and abs(right_s.x - left_s.x) > FRONT_SHOULDER_MAX_WIDTH
+                )
+                session.update_arm_tracking(
+                    left_arm_ok=arm_tracking_ok(pose, "left", config),
+                    right_arm_ok=arm_tracking_ok(pose, "right", config),
+                    too_close=too_close,
+                )
                 features = extract_biomechanical_features(
                     pose,
                     min_visibility=config.min_landmark_visibility,
@@ -592,7 +673,17 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                     frame=packet.frame,
                 )
                 result = multiview.filter_result(result, packet.timestamp_ms)
-                if calibrator.active and classifier.name == "heuristic":
+                if session.awaiting_setup:
+                    result = replace(
+                        result,
+                        events=(),
+                        display_name=session.setup_status,
+                        candidate=session.setup_status,
+                        rejection="camara no lista",
+                        moving=False,
+                    )
+                    classifier.reset()
+                elif calibrator.active and classifier.name == "heuristic":
                     calibrator.observe(packet.timestamp_ms, classifier.telemetry)
                     if calibrator.finished(packet.timestamp_ms):
                         proposed = calibrator.propose(classifier.settings)
@@ -608,8 +699,26 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                             moving=True,
                         )
                 session.advance(packet.timestamp_ms, result)
+                recorder.record_frame(
+                    timestamp_ns=packet.timestamp_ns,
+                    frame_id=packet.frame_index,
+                    pose=pose,
+                    result=result,
+                    frame_size=(packet.width, packet.height),
+                    primary_frame=packet.frame,
+                    active=session.running and not session.awaiting_setup,
+                    rig_frame=camera.last_frame,
+                    external_motion_mask=vision_lab.activity_mask,
+                    external_motion_score=vision_telemetry.external_motion_score,
+                    external_segmentation_confidence=vision_telemetry.segmentation_confidence,
+                    external_sync_valid=vision_telemetry.sync_valid,
+                    external_role=vision_telemetry.external_role,
+                )
                 fps = fps_meter.tick()
-                if result.counted or result.status == "unknown" or result.rejection:
+                if (
+                    not session.awaiting_setup
+                    and (result.counted or result.status == "unknown" or result.rejection)
+                ):
                     kind = "confirmado" if result.counted else (
                         "no_identificado" if result.status == "unknown" else "rechazo"
                     )
@@ -630,6 +739,9 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                             "depth_fusion": result.diagnostics.get("depth_fusion"),
                             "depth_assist": result.diagnostics.get("depth_assist"),
                             "depth_gate": result.diagnostics.get("depth_gate"),
+                            "external_motion_score": vision_telemetry.external_motion_score,
+                            "segmentation_confidence": vision_telemetry.segmentation_confidence,
+                            "sync_valid": vision_telemetry.sync_valid,
                             "event_sources": [event.source for event in result.events],
                             "event_labels": [event.label_id for event in result.events],
                         }
@@ -641,10 +753,35 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                     fps,
                     config,
                     live=session.view(packet.timestamp_ms),
-                    aux_frame=multiview.preview_bgr,
+                    aux_frame=(
+                        vision_lab.preview_bgr
+                        if vision_lab.preview_bgr is not None
+                        else multiview.preview_bgr
+                    ),
+                    aux_label="STEREN",
+                    aux_ready=vision_telemetry.calibrated,
                 )
                 cv2.imshow(LIVE_WINDOW_TITLE, display)
                 key = cv2.waitKey(1) & 0xFF
+                if vision_lab.handle_key(key):
+                    continue
+                if key in (ord("r"), ord("R")):
+                    recorder.reset()
+                    front_setup.reset()
+                    classifier.reset()
+                    recorder.update_metadata(
+                        camera_roles=camera.role_indices,
+                        frame_width=config.frame_width,
+                        frame_height=config.frame_height,
+                        mirror_view=config.mirror_view,
+                        external_processing_width=vision_lab.process_width,
+                    )
+                if key in (ord("e"), ord("E")):
+                    break
+                if key in (13,) and session.awaiting_setup:
+                    if session.try_start():
+                        print("Camaras listas. La sesion ya esta contando.")
+                        classifier.reset()
                 if key in (ord("1"), ord("2"), ord("3"), ord("0")):
                     chosen = {"1": "normal", "2": "high", "3": "maximum", "0": default_sensitivity}[chr(key)]
                     tuner = getattr(classifier, "set_sensitivity", None)
@@ -658,7 +795,9 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                 elif key in (ord("d"), ord("D")):
                     session.debug = not session.debug
                 elif key in (ord("c"), ord("C")):
-                    if classifier.name == "heuristic":
+                    if session.awaiting_setup:
+                        print("Primero ajusta las camaras y pulsa ENTER para empezar.")
+                    elif classifier.name == "heuristic":
                         calibrator.start(packet.timestamp_ms)
                         print("Calibración de 14 s. Los golpes de esta rutina no se guardan para NEAT.")
                     else:
@@ -682,16 +821,26 @@ def run_live(config: AppConfig, args: argparse.Namespace) -> int:
                         )
                         multiview.open(camera)
                         session.camera_line = multiview.role_line
+                        front_setup.reset()
+                        if session.require_camera_setup:
+                            session.awaiting_setup = True
+                            session.running = False
+                            session.setup_ready = False
+                            session.setup_status = "AJUSTA CAMARA PARA MEDIR ANGULOS"
                         classifier.reset()
                 if session.handle_key(key):
                     break
     finally:
+        vision_lab.close()
         multiview.close()
         close = getattr(classifier, "close", None)
         if close is not None:
             close()
         camera.release()
         cv2.destroyAllWindows()
+        report = recorder.finalize()
+        print(f"Sesión guardada en {report.directory}")
+        show_session_analysis(report)
     return 0
 
 
@@ -1073,8 +1222,9 @@ def _draw_calibration_overlay(
     cv2.putText(image, progress, (18, panel_top + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.46, accent, 1, cv2.LINE_AA)
     cv2.putText(image, detail[: max(36, (width - 36) // 8)], (18, panel_top + 78), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (222, 226, 232), 1, cv2.LINE_AA)
 
-    body = "CUERPO OK" if snapshot.get("body_visible") else "ADVERTENCIA: hombros/caderas no visibles"
-    body_color = (80, 220, 120) if snapshot.get("body_visible") else (70, 175, 255)
+    front_ready = snapshot.get("front_ready", snapshot.get("body_visible"))
+    body = "BRAZOS/HOMBROS OK" if front_ready else "AJUSTA HOMBROS, CODOS Y MUNECAS"
+    body_color = (80, 220, 120) if front_ready else (70, 175, 255)
     cv2.putText(image, ascii_text(body), (18, panel_top + 103), cv2.FONT_HERSHEY_SIMPLEX, 0.43, body_color, 1, cv2.LINE_AA)
     fps = snapshot.get("fps")
     fps_text = "--" if not isinstance(fps, (int, float)) else f"{float(fps):.1f}"
@@ -1120,9 +1270,10 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
     """Calibración individual real; guarda una propuesta, no la aplica."""
 
     from app.multiview import MultiViewMonitor
+    from app.vision_lab.ui_integration import ExternalVisionLab
     from app.trainer.calibration_session import CalibrationProtocol, save_calibration
     from app.trainer.factory import create_classifier
-    from app.trainer.preflight import orientation_label, tracking_snapshot
+    from app.trainer.preflight import FrontSetupTracker, orientation_label, tracking_snapshot
 
     if args.classifier != "heuristic":
         print("La calibración individual actual aplica únicamente al clasificador heurístico.")
@@ -1141,9 +1292,11 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
     fps_meter = FrameRateMeter(config.fps_window_size)
     camera = camera_for_config(config)
     multiview = MultiViewMonitor(config)
+    vision_lab = ExternalVisionLab()
+    front_setup = FrontSetupTracker(config)
     print("Calibración individual real del detector heurístico.")
     print("No modifica el clasificador ni crea muestras NEAT.")
-    print("En preflight: F = frontal, A = 30–45°, ENTER inicia, Q sale.")
+    print("En preflight: F = frontal, A = 30–45°, B = capturar fondo Steren, ENTER inicia, Q sale.")
     print("En revisión: Y/ENTER confirma, 0–4 corrige, R repite, X excluye.")
 
     try:
@@ -1159,6 +1312,9 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
                 packet = camera.read()
                 if camera.last_frame is not None:
                     multiview.observe(camera.last_frame, camera)
+                    vision_telemetry = vision_lab.observe(camera.last_frame)
+                else:
+                    vision_telemetry = vision_lab.telemetry
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
                 features = extract_biomechanical_features(
                     pose,
@@ -1174,6 +1330,15 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
                     orientation=orientation,
                     left_elbow_angle=features.left_elbow_angle,
                     right_elbow_angle=features.right_elbow_angle,
+                )
+                readiness = front_setup.observe(pose)
+                snapshot.update(
+                    {
+                        "front_ready": readiness.ready,
+                        "front_status": readiness.status,
+                        "front_arm_quality": readiness.arm_quality,
+                        "front_stable_frames": readiness.stable_frames,
+                    }
                 )
                 preflight_rows.append(snapshot)
                 previous = protocol.phase
@@ -1198,10 +1363,25 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
                     )
                     evidence.update(snapshot)
                     protocol.observe(packet.timestamp_ms, evidence, events=result.events)
-                display = render_frame(packet.frame, pose, features, fps, config)
+                display = render_frame(
+                    packet.frame,
+                    pose,
+                    features,
+                    fps,
+                    config,
+                    aux_frame=(
+                        vision_lab.preview_bgr
+                        if vision_lab.preview_bgr is not None
+                        else multiview.preview_bgr
+                    ),
+                    aux_label="STEREN",
+                    aux_ready=vision_telemetry.calibrated,
+                )
                 _draw_calibration_overlay(display, protocol.view(), snapshot, orientation)
                 cv2.imshow(LIVE_WINDOW_TITLE, display)
                 key = cv2.waitKey(1) & 0xFF
+                if vision_lab.handle_key(key):
+                    continue
                 if key in (ord("q"), ord("Q"), 27):
                     break
                 if protocol.phase == "preflight":
@@ -1210,8 +1390,11 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
                     elif key in (ord("a"), ord("A")):
                         orientation = "angulo_30_45"
                     elif key in (13, 10, ord(" ")):
-                        protocol.start(packet.timestamp_ms)
-                        classifier.reset()
+                        if readiness.ready:
+                            protocol.start(packet.timestamp_ms)
+                            classifier.reset()
+                        else:
+                            print(f"Preflight incompleto: {readiness.status}")
                 elif protocol.phase == "review":
                     if key in (ord("y"), ord("Y"), ord(" "), 13, 10):
                         protocol.confirm()
@@ -1224,6 +1407,7 @@ def run_calibrate(config: AppConfig, args: argparse.Namespace) -> int:
                 if protocol.finished:
                     break
     finally:
+        vision_lab.close()
         multiview.close()
         camera.release()
         cv2.destroyAllWindows()
@@ -1270,6 +1454,9 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
     from app.targets.review import ReviewStore
     from app.targets.training import TargetTraining
     from app.trainer.factory import create_classifier
+    from app.vision_lab.session_recorder import SessionRecorder
+    from app.vision_lab.session_report import show_session_analysis
+    from app.vision_lab.ui_integration import ExternalVisionLab
 
     config.validate()
     if args.review_session:
@@ -1308,6 +1495,8 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
     fps_meter = FrameRateMeter(config.fps_window_size)
     camera = camera_for_config(config)
     multiview = MultiViewMonitor(config)
+    vision_lab = ExternalVisionLab()
+    recorder = SessionRecorder(args.results_dir, classifier="heuristic", session_kind="targets")
     print("Target Training. El detector heurístico solo propone eventos.")
     print("La etiqueta del objetivo no queda verificada hasta la revisión.")
     print("La puntuación del juego no es la precisión de NEAT.")
@@ -1335,6 +1524,13 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
             multiview.open(camera)
+            recorder.update_metadata(
+                camera_roles=camera.role_indices,
+                frame_width=config.frame_width,
+                frame_height=config.frame_height,
+                mirror_view=config.mirror_view,
+                external_processing_width=vision_lab.process_width,
+            )
             cv2.namedWindow("EvoBox AI — Objetivos", cv2.WINDOW_NORMAL)
 
             def _on_click(event: int, x: int, y: int, _flags: int, _param: object) -> None:
@@ -1346,6 +1542,9 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
                 packet = camera.read()
                 if camera.last_frame is not None:
                     multiview.observe(camera.last_frame, camera)
+                    vision_telemetry = vision_lab.observe(camera.last_frame)
+                else:
+                    vision_telemetry = vision_lab.telemetry
                 pose = tracker.detect(packet.frame, packet.timestamp_ms)
                 features = extract_biomechanical_features(
                     pose,
@@ -1360,6 +1559,21 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
                     frame=packet.frame,
                 )
                 result = multiview.filter_result(result, packet.timestamp_ms)
+                recorder.record_frame(
+                    timestamp_ns=packet.timestamp_ns,
+                    frame_id=packet.frame_index,
+                    pose=pose,
+                    result=result,
+                    frame_size=(packet.width, packet.height),
+                    primary_frame=packet.frame,
+                    active=session.phase == "execute",
+                    rig_frame=camera.last_frame,
+                    external_motion_mask=vision_lab.activity_mask,
+                    external_motion_score=vision_telemetry.external_motion_score,
+                    external_segmentation_confidence=vision_telemetry.segmentation_confidence,
+                    external_sync_valid=vision_telemetry.sync_valid,
+                    external_role=vision_telemetry.external_role,
+                )
                 left = pose.landmark(LandmarkId.LEFT_SHOULDER)
                 right = pose.landmark(LandmarkId.RIGHT_SHOULDER)
                 tracking = bool(
@@ -1438,12 +1652,22 @@ def run_targets(config: AppConfig, args: argparse.Namespace) -> int:
                 session.advance_playback(33)
                 cv2.imshow("EvoBox AI — Objetivos", display)
                 key = cv2.waitKeyEx(1)
+                if vision_lab.handle_key(key & 0xFF):
+                    continue
                 if key >= 0 and session.handle_key(key, packet.timestamp_ms):
                     break
+                if key in (ord("r"), ord("R")):
+                    recorder.reset()
+                    recorder.update_metadata(camera_roles=camera.role_indices)
     finally:
+        vision_lab.close()
         multiview.close()
         camera.release()
         cv2.destroyAllWindows()
+
+    report = recorder.finalize()
+    print(f"Sesión de objetivos guardada en {report.directory}")
+    show_session_analysis(report)
     counts = review.counts()
     verified = review.verified_counts()
     print(f"Sesión {review.session_id}")
@@ -1596,6 +1820,7 @@ def main() -> int:
         camera_depth_index=args.camera_depth_index,
         camera_max_scan_index=args.camera_max_scan_index,
         depth_gate=args.depth_gate,
+        arm_only=args.arm_only,
         frame_width=args.width,
         frame_height=args.height,
         mirror_view=not args.no_mirror,

@@ -19,6 +19,9 @@ from app.pose_tracker import LandmarkId, PoseTracker
 from app.targets.placement import PointSmoother, body_offset
 from app.trainer.factory import create_classifier
 from main import FrameRateMeter, camera_for_config
+from app.vision_lab.session_recorder import SessionRecorder
+from app.vision_lab.session_report import show_session_analysis
+from app.vision_lab.ui_integration import ExternalVisionLab
 
 
 GAME_WINDOW = "EvoBox AI"
@@ -53,6 +56,8 @@ def run_game(config: AppConfig, args: argparse.Namespace) -> int:
     )
     camera = camera_for_config(config)
     multiview = MultiViewMonitor(config)
+    vision_lab = ExternalVisionLab()
+    recorder = SessionRecorder(args.results_dir, classifier=kind, session_kind=f"game-{mode}")
     fps_meter = FrameRateMeter(config.fps_window_size)
     try:
         with PoseTracker(
@@ -62,6 +67,13 @@ def run_game(config: AppConfig, args: argparse.Namespace) -> int:
             min_tracking_confidence=config.min_tracking_confidence,
         ) as tracker, camera:
             multiview.open(camera)
+            recorder.update_metadata(
+                camera_roles=camera.role_indices,
+                frame_width=config.frame_width,
+                frame_height=config.frame_height,
+                mirror_view=config.mirror_view,
+                external_processing_width=vision_lab.process_width,
+            )
             _open_window(config.frame_width, config.frame_height)
             print(f"Juego {args.game_mode}. Clasificador activo: {classifier.name}.")
             if classifier.name == "neat":
@@ -75,23 +87,27 @@ def run_game(config: AppConfig, args: argparse.Namespace) -> int:
             duration_ms = int(args.round_seconds * 1000)
             if args.game_mode == "free":
                 game: FreeRound | TargetChallenge = FreeRound(classifier.name, duration_ms=duration_ms)
-                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game, multiview)
+                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game, multiview, vision_lab, recorder)
             if args.game_mode == "targets":
                 game = TargetChallenge(
                     classifier.name,
                     difficulty=args.difficulty,
                     duration_ms=duration_ms,
                 )
-                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game, multiview)
+                return _play_loop(config, args, classifier, camera, tracker, fps_meter, game, multiview, vision_lab, recorder)
             print("El modo de juego debe ser free o targets.")
             return 2
     finally:
+        vision_lab.close()
         multiview.close()
         close = getattr(classifier, "close", None)
         if close is not None:
             close()
         cv2.destroyWindow(GAME_WINDOW)
         cv2.waitKey(1)
+        report = recorder.finalize()
+        print(f"Sesión de juego guardada en {report.directory}")
+        show_session_analysis(report)
     return 0
 
 
@@ -182,6 +198,8 @@ def _play_loop(
     fps_meter: FrameRateMeter,
     game: FreeRound | TargetChallenge,
     multiview: MultiViewMonitor,
+    vision_lab: ExternalVisionLab,
+    recorder: SessionRecorder,
 ) -> int:
     left_smoother = PointSmoother()
     right_smoother = PointSmoother()
@@ -190,6 +208,9 @@ def _play_loop(
         packet = camera.read()
         if camera.last_frame is not None:
             multiview.observe(camera.last_frame, camera)
+            vision_telemetry = vision_lab.observe(camera.last_frame)
+        else:
+            vision_telemetry = vision_lab.telemetry
         pose = tracker.detect(packet.frame, packet.timestamp_ms)
         features = extract_biomechanical_features(
             pose,
@@ -204,6 +225,20 @@ def _play_loop(
             frame=packet.frame,
         )
         result = multiview.filter_result(result, packet.timestamp_ms)
+        recorder.record_frame(
+            timestamp_ns=packet.timestamp_ns,
+            pose=pose,
+            result=result,
+            frame_size=(packet.width, packet.height),
+            primary_frame=packet.frame,
+            active=game.phase == "active",
+            rig_frame=camera.last_frame,
+            external_motion_mask=vision_lab.activity_mask,
+            external_motion_score=vision_telemetry.external_motion_score,
+            external_segmentation_confidence=vision_telemetry.segmentation_confidence,
+            external_sync_valid=vision_telemetry.sync_valid,
+            external_role=vision_telemetry.external_role,
+        )
         fps = fps_meter.tick()
         display = render_frame(packet.frame, pose, features, fps, config, overlay=False)
         tracking = _tracking(pose)
@@ -250,6 +285,11 @@ def _play_loop(
                 saved = True
         _show(display, packet.width, packet.height)
         key = cv2.waitKeyEx(1)
+        if vision_lab.handle_key(key & 0xFF):
+            continue
+        if key in (ord("r"), ord("R")):
+            recorder.reset()
+            recorder.update_metadata(camera_roles=camera.role_indices)
         if key >= 0 and game.handle_key(key):
             break
         if game.phase == "idle":

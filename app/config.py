@@ -26,6 +26,7 @@ class AppConfig:
     camera_depth_index: int | None = None
     camera_max_scan_index: int = 8
     depth_gate: str = "soft"
+    arm_only: bool = False
     frame_width: int = 640
     frame_height: int = 480
     mirror_view: bool = True

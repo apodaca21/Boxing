@@ -70,6 +70,9 @@ class HeuristicSettings:
     allow_early_confirm: bool = False
     confirm_on_slowdown: bool = False
     profile_name: str = "normal"
+    # Cuando está activo, la trayectoria solo decide el brazo. No intenta
+    # separar jab/gancho, que es la parte más sensible al encuadre de cámara.
+    arm_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,6 +457,12 @@ class _ArmTracker:
         event_peak_lateral: float | None = None,
     ) -> _ArmDecision:
         candidate = None
+        if unknown and event is None:
+            candidate = (
+                "Golpe brazo izquierdo (tipo incierto)"
+                if self.side == "left"
+                else "Golpe brazo derecho (tipo incierto)"
+            )
         if event is None and phase not in (STATUS_NEUTRAL, STATUS_COMPLETED):
             # La geometría intermedia de un gancho atraviesa posturas que
             # parecen jab/cross. No muestres una clase hasta haber observado
@@ -523,7 +532,47 @@ class _ArmTracker:
     def _classify(self) -> PunchEvent | None:
         extension_gain = self.peak_extension - self.frozen_extension
         elbow_gain = self.peak_elbow_gain
+
+        if self.settings.arm_only:
+            moved = (
+                extension_gain >= self.settings.start_extension
+                or self.peak_lateral >= self.settings.lateral_start
+            )
+            if not moved:
+                self.last_classification_reason = "movimiento de brazo insuficiente"
+                return None
+            self.last_classification_reason = (
+                f"brazo {self.side}: trayectoria confirmada"
+            )
+            label_id = 1 if self.side == "left" else 2
+            display_name = (
+                "Golpe izquierdo" if self.side == "left" else "Golpe derecho"
+            )
+            return PunchEvent(
+                label_id,
+                display_name,
+                self.side,
+                counter_key=(
+                    "golpe_izquierdo" if self.side == "left" else "golpe_derecho"
+                ),
+                event_id=self.event_id,
+                started_ms=self.started_ms,
+                confirmed=True,
+                source="heuristic",
+            )
+
         wide = self.peak_lateral >= self.settings.hook_lateral
+        # Un jab/cross hacia la cámara se proyecta un poco de lado; un gancho
+        # real debe ganar más en lateral que en alcance. Esa proporción evita
+        # intercambiar jab y gancho en la práctica con el candidato de prueba.
+        lateral_dominant = self.peak_lateral >= max(
+            self.settings.hook_lateral,
+            extension_gain * 1.15,
+        )
+        extension_dominant = extension_gain >= max(
+            self.settings.straight_gain,
+            self.peak_lateral * 1.05,
+        )
         self.last_classification_reason = None
 
         # La evidencia de recto tiene prioridad sobre la anchura aparente. En
@@ -539,13 +588,16 @@ class _ArmTracker:
         )
         hook = (
             wide
+            and lateral_dominant
             and self.peak_elbow <= self.settings.hook_elbow_max
             and elbow_gain <= self.settings.hook_elbow_gain_max
         )
         if straight and hook:
-            # Un gancho real acumula anchura; no lo conviertas en jab porque
-            # el codo también se abrió durante el mismo ciclo.
-            if self.peak_lateral >= max(extension_gain, self.settings.hook_lateral):
+            if lateral_dominant and not extension_dominant:
+                straight = False
+            elif extension_dominant:
+                hook = False
+            elif self.peak_lateral >= max(extension_gain, self.settings.hook_lateral):
                 straight = False
             else:
                 hook = False
@@ -563,12 +615,13 @@ class _ArmTracker:
             extension_gain >= self.settings.start_extension
             or self.peak_lateral >= self.settings.lateral_start
         ):
-            if self.peak_lateral >= max(extension_gain, self.settings.lateral_start):
-                self.last_classification_reason = "candidato lateral sin evidencia completa"
-                label_id = 3 if self.side == "left" else 4
-            else:
-                self.last_classification_reason = "candidato frontal sin evidencia completa"
-                label_id = 1 if self.side == "left" else 2
+            # El lado ya lo conoce este tracker; el tipo no. No inventamos
+            # jab/gancho por la dirección dominante cuando la evidencia es
+            # insuficiente: el resultado conserva el brazo y queda incierto.
+            self.last_classification_reason = (
+                f"tipo ambiguo; brazo {self.side} confirmado"
+            )
+            return None
         else:
             self.last_classification_reason = "geometria ambigua o insuficiente"
             return None
@@ -741,17 +794,29 @@ def _body_down(
 
 _POSE_MIN_VISIBILITY = 0.5
 _POSE_MIN_PRESENCE = 0.5
+# Las muñecas bajan de visibilidad en golpes rápidos; un umbral más bajo evita
+# perder el brazo y confundir izquierda/derecha a mitad de sesión.
+_WRIST_MIN_VISIBILITY = 0.32
+_WRIST_MIN_PRESENCE = 0.40
 
 
 def _source_is_reliable(
     source: tuple[LandmarkObservation, ...],
     required: tuple[LandmarkId, ...],
 ) -> bool:
-    return bool(source) and all(
-        index < len(source)
-        and source[int(index)].is_reliable(_POSE_MIN_VISIBILITY, _POSE_MIN_PRESENCE)
-        for index in required
-    )
+    if not source:
+        return False
+    for landmark_id in required:
+        index = int(landmark_id)
+        if index >= len(source):
+            return False
+        point = source[index]
+        if landmark_id in (LandmarkId.LEFT_WRIST, LandmarkId.RIGHT_WRIST):
+            if not point.is_reliable(_WRIST_MIN_VISIBILITY, _WRIST_MIN_PRESENCE):
+                return False
+        elif not point.is_reliable(_POSE_MIN_VISIBILITY, _POSE_MIN_PRESENCE):
+            return False
+    return True
 
 
 def _coordinates(point: LandmarkObservation, *, use_depth: bool) -> tuple[float, float, float]:
@@ -912,7 +977,11 @@ class HeuristicClassifier:
     def set_sensitivity(self, name: str) -> None:
         from app.trainer.sensitivity import profile_settings
 
-        self.apply_settings(profile_settings(name))
+        # Cambiar sensibilidad durante la sesión no debe apagar el modo que
+        # eligió la persona para contar solamente por brazo.
+        self.apply_settings(
+            replace(profile_settings(name), arm_only=self.settings.arm_only)
+        )
 
     def update(
         self,

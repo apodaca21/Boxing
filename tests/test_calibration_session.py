@@ -14,7 +14,7 @@ from app.trainer.calibration_session import (
     save_calibration,
 )
 from app.trainer.heuristic import HeuristicSettings
-from app.trainer.preflight import tracking_snapshot
+from app.trainer.preflight import FrontSetupTracker, tracking_snapshot
 
 
 def _pose(timestamp_ms: int = 0) -> PoseObservation:
@@ -38,6 +38,27 @@ class CalibrationSessionTests(unittest.TestCase):
         self.assertEqual(snapshot["right_arm_tracking_quality"], 1.0)
         self.assertEqual(snapshot["required_landmarks_quality"], 1.0)
         self.assertEqual(snapshot["orientation"], "frontal")
+
+    def test_front_setup_requires_stable_framing_before_ready(self) -> None:
+        tracker = FrontSetupTracker(AppConfig())
+        pose = _pose()
+        first = tracker.observe(pose)
+        self.assertFalse(first.ready)
+        self.assertIn("ESTABILIZANDO", first.status)
+        for _ in range(10):
+            readiness = tracker.observe(pose)
+        self.assertTrue(readiness.ready)
+        self.assertIn("LISTA", readiness.status)
+
+    def test_front_setup_rejects_too_close_shoulders(self) -> None:
+        tracker = FrontSetupTracker(AppConfig())
+        points = list(_pose().landmarks)
+        points[int(LandmarkId.LEFT_SHOULDER)] = LandmarkObservation(0.10, 0.3, 0.0, 1.0, 1.0)
+        points[int(LandmarkId.RIGHT_SHOULDER)] = LandmarkObservation(0.90, 0.3, 0.0, 1.0, 1.0)
+        close = PoseObservation(0, tuple(points), tuple(points))
+        readiness = tracker.observe(close)
+        self.assertFalse(readiness.ready)
+        self.assertIn("ALEJATE", readiness.status.upper())
 
     def test_protocol_requires_human_confirmation(self) -> None:
         protocol = CalibrationProtocol(

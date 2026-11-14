@@ -84,10 +84,15 @@ def no_detection_result(source: str) -> ClassificationResult:
 
 
 def unknown_result(source: str, arm: str | None = None) -> ClassificationResult:
+    display_name = "MOVIMIENTO NO IDENTIFICADO"
+    if arm == "left":
+        display_name = "GOLPE BRAZO IZQUIERDO — TIPO INCIERTO"
+    elif arm == "right":
+        display_name = "GOLPE BRAZO DERECHO — TIPO INCIERTO"
     return ClassificationResult(
         source=source,
         status=STATUS_UNKNOWN,
         label_id=None,
-        display_name="MOVIMIENTO NO IDENTIFICADO",
+        display_name=display_name,
         active_arm=arm,
     )

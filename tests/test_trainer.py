@@ -228,6 +228,18 @@ class HeuristicDetectorTests(unittest.TestCase):
         self.assertTrue(any(result.status == STATUS_UNKNOWN for result in results))
         self.assertTrue(all(result.label_id != 1 for result in results))
 
+    def test_ambiguous_motion_keeps_the_anatomical_arm_without_guessing_type(self) -> None:
+        frames = [_guard(0)]
+        extensions = (1.2, 1.6, 2.0, 2.0, 1.4, 1.0, 0.9)
+        for index, extension in enumerate(extensions, start=1):
+            frames.append(_features(index * 40, right_extension=extension, right_elbow=95))
+        results = _feed(self.classifier, frames)
+        uncertain = [result for result in results if result.status == STATUS_UNKNOWN]
+        self.assertTrue(uncertain)
+        self.assertTrue(any(result.active_arm == "right" for result in uncertain))
+        self.assertTrue(any("DERECHO" in result.display_name for result in uncertain))
+        self.assertTrue(all(result.label_id is None for result in uncertain))
+
 
     def test_camera_facing_jab_counts_from_depth(self) -> None:
         classifier = HeuristicClassifier()
@@ -296,6 +308,58 @@ class HeuristicDetectorTests(unittest.TestCase):
         )
         completed = [result for result in results if result.counted]
         self.assertIn("recto", completed[0].diagnostics["left_classification_reason"])
+
+    def test_long_reach_with_some_side_drift_stays_a_cross_on_high(self) -> None:
+        """Un cross largo no debe etiquetarse como gancho por un poco de deriva."""
+
+        from app.trainer.sensitivity import profile_settings
+
+        frames = []
+        positions = (0.30, 0.30, 0.42, 0.55, 0.62, 0.60, 0.48, 0.36, 0.30)
+        extensions = (0.90, 0.90, 1.25, 1.70, 2.15, 2.20, 1.70, 1.20, 0.90)
+        elbows = (90, 90, 120, 145, 165, 170, 150, 115, 90)
+        for index, (x, extension, elbow) in enumerate(zip(positions, extensions, elbows, strict=True)):
+            frames.append(
+                _features(
+                    index * 40,
+                    right_x=x,
+                    right_extension=extension,
+                    right_elbow=elbow,
+                )
+            )
+        results = _feed(
+            HeuristicClassifier(profile_settings("high")),
+            frames,
+        )
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [2],
+        )
+
+    def test_true_hook_still_beats_a_short_extension_on_high(self) -> None:
+        from app.trainer.sensitivity import profile_settings
+
+        frames = []
+        positions = (-0.30, -0.30, -0.55, -0.85, -1.15, -1.20, -0.80, -0.45, -0.30)
+        extensions = (0.90, 0.90, 0.95, 1.00, 1.05, 1.05, 0.98, 0.92, 0.90)
+        elbows = (95, 95, 100, 105, 110, 112, 105, 98, 95)
+        for index, (x, extension, elbow) in enumerate(zip(positions, extensions, elbows, strict=True)):
+            frames.append(
+                _features(
+                    index * 40,
+                    left_x=x,
+                    left_extension=extension,
+                    left_elbow=elbow,
+                )
+            )
+        results = _feed(
+            HeuristicClassifier(profile_settings("high")),
+            frames,
+        )
+        self.assertEqual(
+            [event.label_id for result in results for event in result.events],
+            [3],
+        )
 
     def test_two_jabs_and_jab_cross_use_independent_arm_recovery(self) -> None:
         first = _straight_cycle(0, side="left")
@@ -420,6 +484,42 @@ def _arm_pose(
 
 
 class SessionTests(unittest.TestCase):
+    def test_camera_setup_blocks_counting_until_enter(self) -> None:
+        session = TrainingSession(require_camera_setup=True)
+        punch = ClassificationResult(
+            source="heuristic",
+            status="completado",
+            label_id=1,
+            display_name="Jab izquierdo",
+            events=(PunchEvent(1, "Jab izquierdo", "left"),),
+            active_arm="left",
+        )
+        self.assertTrue(session.awaiting_setup)
+        self.assertFalse(session.running)
+        session.update_camera_setup(
+            front_ready=False,
+            front_status="FRONTAL MUESTRA BRAZOS",
+            depth_ready=False,
+            depth_required=True,
+            depth_status="DEPTH AJUSTA",
+        )
+        self.assertFalse(session.try_start())
+        session.advance(0, punch)
+        self.assertEqual(session.counts[1], 0)
+
+        session.update_camera_setup(
+            front_ready=True,
+            front_status="FRONTAL LISTA",
+            depth_ready=True,
+            depth_required=True,
+            depth_status="DEPTH LISTA",
+        )
+        self.assertTrue(session.setup_ready)
+        self.assertTrue(session.try_start())
+        session.advance(1000, punch)
+        self.assertEqual(session.counts[1], 1)
+        self.assertFalse(session.awaiting_setup)
+
     def test_pause_and_reset_control_the_counters(self) -> None:
         session = TrainingSession()
         punch = ClassificationResult(
